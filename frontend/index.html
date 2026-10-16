@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>忒修斯 · web</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div class="brand"><span class="dot">◆</span> 忒修斯 <em>web</em></div>
+    <button id="btn-new" class="primary">＋ 新会话</button>
+    <label class="lbl">模型</label>
+    <select id="model-sel"></select>
+    <label class="lbl">会话</label>
+    <div id="sessions"></div>
+    <div class="side-foot">
+      <button class="nav-btn" data-view="models">模型</button>
+      <button class="nav-btn" data-view="memlib">忆库</button>
+      <button class="nav-btn" data-view="skills">技能</button>
+      <button class="nav-btn" data-view="ledger">账本</button>
+      <button class="nav-btn" id="btn-admin" data-view="admin" hidden>管理</button>
+      <button id="btn-cfg">⚙ 连接</button>
+    </div>
+    <div id="user-chip" class="user-chip" hidden></div>
+    <div id="conn" class="conn">未连接</div>
+  </aside>
+  <main id="main">
+    <div id="chat-view">
+      <div id="chat"></div>
+      <div id="input-row">
+        <textarea id="input" rows="3" placeholder="问点什么… (Enter 发送, Shift+Enter 换行)"></textarea>
+        <div class="input-btns">
+          <button id="btn-stop" class="danger" disabled>中断</button>
+          <button id="btn-send" class="primary">发送</button>
+        </div>
+      </div>
+    </div>
+    <div id="models-view" hidden>
+      <h2>模型</h2>
+      <p class="dim">官方家直接贴 key 即用 —— 超管存的 key 全员共用(公共), 普通用户存的只自己可见(私有)。「拉清单」看这家真实能调的型号, 点一下即加入; key 只落服务器文件, 回显永远打码。</p>
+      <h3>官方家</h3>
+      <div id="providers-list"></div>
+      <h3>自增档(OpenAI 兼容中转)</h3>
+      <div class="card form">
+        <label>名称<label2>(随便起, 会话下拉里显示)</label2></label>
+        <input id="m-label" placeholder="我的中转">
+        <label>base_url</label>
+        <input id="m-base" placeholder="https://api.deepseek.com/v1">
+        <label>API key</label>
+        <input id="m-key" type="password" placeholder="sk-…">
+        <label>模型</label>
+        <input id="m-model" placeholder="deepseek-v4-pro">
+        <div class="row">
+          <button id="m-save" class="primary">保存</button>
+          <span id="m-msg" class="dim"></span>
+        </div>
+      </div>
+      <h3>已加入可用</h3>
+      <div id="models-list"></div>
+    </div>
+    <div id="memlib-view" hidden>
+      <h2>忆库(跨会话记忆卡)</h2>
+      <p class="dim">留档区 = 长期记忆; 遗忘区 = 待清(周末自动清空)。点卡看内容; 「注入」把卡作为既有事实塞进当前会话的对话里。</p>
+      <div class="memlib">
+        <div class="mem-col">
+          <h3>留档区</h3><div id="mem-archive" class="mem-list"></div>
+        </div>
+        <div class="mem-col">
+          <h3>遗忘区</h3><div id="mem-forget" class="mem-list"></div>
+        </div>
+        <div class="mem-reader card" id="mem-reader">
+          <p class="dim">← 点一张卡</p>
+        </div>
+      </div>
+    </div>
+    <div id="skills-view" hidden>
+      <h2>技能包</h2>
+      <p class="dim">任务对得上就先读全文照着做(agent 侧 skill 工具同源); user 层同名会盖 repo 层。</p>
+      <div class="skills-wrap">
+        <div id="skills-list" class="mem-list" style="flex:1"></div>
+        <div class="mem-reader card" id="skill-reader">
+          <p class="dim">← 点一份技能</p>
+        </div>
+      </div>
+    </div>
+    <div id="ledger-view" hidden>
+      <h2>分包账本</h2>
+      <p class="dim">每笔分身/识图自动落账(spawn/look_image); 聚总按「发起者→分身模型」。</p>
+      <div id="ledger-agg"></div>
+      <table id="ledger-table">
+        <thead><tr><th>时间</th><th>类型</th><th>模型</th><th>任务</th>
+          <th>结果</th><th>tokens</th><th>墙钟</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="admin-view" hidden>
+      <h2>管理(仅超管)</h2>
+      <div class="card form" style="max-width:460px">
+        <label>开户: 用户名</label>
+        <input id="a-name" placeholder="同事的账号名">
+        <label>初始密码</label>
+        <input id="a-pass" type="password">
+        <label>角色</label>
+        <select id="a-role"><option value="user">普通用户</option>
+          <option value="admin">超管</option></select>
+        <div class="row">
+          <button id="a-save" class="primary">开户</button>
+          <span id="a-msg" class="dim"></span>
+        </div>
+        <p class="dim">开户后把「用户名+初始密码」发给同事; 令牌在下面清单里可重置。</p>
+      </div>
+      <h3>用户</h3>
+      <div id="admin-users"></div>
+      <h3>审计(只增不改)</h3>
+      <div id="admin-audit"></div>
+    </div>
+  </main>
+</div>
+<div id="login-mask" hidden>
+  <div class="card cfg">
+    <h3>登录</h3>
+    <label>用户名</label>
+    <input id="l-user" placeholder="你的账号">
+    <label>密码</label>
+    <input id="l-pass" type="password">
+    <div class="row">
+      <button id="l-go" class="primary">登录</button>
+      <button id="l-token-mode">用令牌</button>
+    </div>
+    <div id="l-token-row" hidden>
+      <label>访问令牌</label>
+      <input id="l-token" type="password" placeholder="u-… 或超管令牌">
+      <div class="row"><button id="l-token-go" class="primary">以此令牌进入</button></div>
+    </div>
+    <p id="l-msg" class="dim"></p>
+  </div>
+</div>
+<div id="cfg-mask" hidden>
+  <div class="card cfg">
+    <h3>连接后端</h3>
+    <label>后端地址</label>
+    <input id="cfg-base" placeholder="http://127.0.0.1:8787">
+    <label>访问令牌(服务器设了 AT_WEB_TOKEN 才填)</label>
+    <input id="cfg-token" type="password" placeholder="可空">
+    <div class="row">
+      <button id="cfg-save" class="primary">保存并连接</button>
+      <span id="cfg-msg" class="dim"></span>
+    </div>
+    <p class="dim">说明: 同源部署(后端挂前端)时地址留空即可; 双击本文件本地打开时填后端地址。配置存在浏览器 localStorage。</p>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

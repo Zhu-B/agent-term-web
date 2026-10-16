@@ -1,0 +1,47 @@
+{
+  "deepseek": {
+    "base_url": "https://api.deepseek.com",
+    "key_env": "DEEPSEEK_API_KEY",
+    "model": "deepseek-chat",
+    "family": "DeepSeek",
+    "price_in": null,
+    "price_out": null,
+    "_note": "另有 deepseek-reasoner 推理档"
+  },
+  "qwen": {
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "key_env": "DASHSCOPE_API_KEY",
+    "model": "qwen-plus",
+    "family": "Qwen",
+    "price_in": null,
+    "price_out": null,
+    "_note": "阿里百炼兼容模式; 档位 qwen-turbo/plus/max"
+  },
+  "glm": {
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "key_env": "ZHIPU_API_KEY",
+    "model": "glm-4.6",
+    "family": "GLM",
+    "price_in": null,
+    "price_out": null,
+    "_note": "glm-4-flash 为免费档但工具跟随弱; 默认给 glm-4.6"
+  },
+  "siliconflow": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "key_env": "SILICONFLOW_API_KEY",
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "family": "按模型定",
+    "price_in": null,
+    "price_out": null,
+    "_note": "聚合平台, 部分小模型有免费档; 同族判定看模型名前缀"
+  },
+  "openrouter": {
+    "base_url": "https://openrouter.ai/api/v1",
+    "key_env": "OPENROUTER_API_KEY",
+    "model": "openai/gpt-4o-mini",
+    "family": "OpenAI",
+    "price_in": null,
+    "price_out": null,
+    "_note": "一个 key 全家族, 需国际卡"
+  }
+}
