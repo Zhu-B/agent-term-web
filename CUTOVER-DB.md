@@ -64,7 +64,7 @@ sqlite 路 `python server.py --check` 18/18 全绿（接管会话复跑确认）
   `sudo -u postgres psql -tAc "SELECT rolname FROM pg_roles WHERE rolname='atweb_test'"`
   / `systemctl is-active atweb`。
 
-**登录通道（重要）**: 腾讯云镜像禁 root 直登; 唯一通道 = `ubuntu@124.222.93.104`
+**登录通道（重要）**: 腾讯云镜像禁 root 直登; 唯一通道 = `ubuntu@<服务器IP>`
 密码登录（sshpass 只在 WSL 有）。WSL 的 atweb_key 与新建的 **atweb_pg** 公钥均**未**装进
 服务器 authorized_keys——恢复时若想免密，先装 atweb_pg 公钥 + 设 NOPASSWD sudo（引导
 命令已备）; 否则照旧 `echo 密码 | sudo -S`。sudo 需密码。
@@ -90,7 +90,7 @@ sqlite 路 `python server.py --check` 18/18 全绿（接管会话复跑确认）
 
 **结果**: atweb 已跑在 PostgreSQL 上; haotian/zhihua/like 三人俱在(admin); 审计写路径已实证
 落在 PG(切闸后 401 探针的 login_fail 直接出现在 PG audit 表头); 公网
-http://124.222.93.104:8787 正常。
+http://<服务器IP>:8787 正常。
 
 **执行中修的雷**: webusers.py `_sql`/`_exec` 直接 `c.execute(...)`——sqlite 连接自带 execute
 所以 sqlite 路 18/18 假绿; psycopg2 连接无此方法, PG 路首个鉴权请求即崩(RemoteDisconnected)。
