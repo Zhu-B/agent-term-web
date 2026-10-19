@@ -44,7 +44,10 @@ CORE = os.path.join(HERE, "core")
 # 必须在 import core 之前设 env —— core 的模块常量在导入时读 env.
 # 此前家法是散在 ~/.agent-term 发现链: 跑在哪台机器就静默继承哪台机器的配置
 # (本地调试会把开发者自己的 models/keys 读出来), 自包含部署从根上灭掉这类事.
-DATA_DIR = os.environ.get("AT_DATA") or os.path.join(HERE, "data")
+# E1.7: data 挪到代码树**外面**(backend 的上一级) —— E2 切版本要整目录覆盖
+# backend/, 数据目录长在树内迟早被埋; 树外后"覆盖代码"与"数据"物理绝缘.
+DATA_DIR = os.environ.get("AT_DATA") or os.path.normpath(
+    os.path.join(HERE, "..", "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 os.environ.setdefault("AT_PROVIDERS", os.path.join(DATA_DIR, "providers.json"))
 os.environ["AT_SETTINGS"] = os.path.join(DATA_DIR, "settings.json")
