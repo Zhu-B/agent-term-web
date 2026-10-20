@@ -226,23 +226,32 @@ async function refreshSessions() {
     const d = document.createElement("div");
     d.className = "sess" + (s.sid === S.sid ? " cur" : "");
     d.innerHTML = (s.busy ? '<span class="busy-dot">● </span>' : "") +
+      (s.archived ? "🗂 " : "") +
       "<span class='s-lab'>" + esc(s.label) + "</span>" +
-      "<span class='s-x' title='关闭会话'>✕</span><br>" +
+      "<span class='s-x' title='" +
+      (s.archived ? "删除历史会话" : "关闭会话") + "'>✕</span>" +
+      "<br>" +
       "<span style='color:var(--dim);font-size:11px'>" + s.sid +
-      (s.owner ? " ·他人" : "") + "</span>";
-    d.onclick = () => openSession(s.sid);
+      (s.archived ? " · 历史" + (s.msgs ? "·" + s.msgs + "条" : "") : "") +
+      (s.owner && s.owner !== (S.me || {}).uid ? " ·他人" : "") + "</span>";
+    d.onclick = () => (s.archived ? openArchived(s.sid)
+                                  : openSession(s.sid));
     d.querySelector(".s-x").onclick = async (e) => {
       e.stopPropagation();
-      if (!confirm("关闭会话 " + s.sid + "? (服务器侧收尾销毁)")) return;
+      const msg = s.archived
+        ? "删除历史会话 " + s.sid + "? (服务器端真删磁盘档, 不可恢复)"
+        : "关闭并删除会话 " + s.sid + "? (服务器侧收尾销毁)";
+      if (!confirm(msg)) return;
       try {
         await api("/api/sessions/" + s.sid, undefined, "DELETE");
-        if (S.sid === s.sid) {       // 关的是当前会话: 清空聊天区
+        if (S.sid === s.sid) {       // 删的是当前会话: 清空聊天区
           if (S.es) { S.es.close(); S.es = null; }
           S.sid = null;
-          chat.innerHTML = '<div class="dim-line">会话已关闭, 新建一个开始</div>';
+          $("arch-bar").hidden = true;
+          chat.innerHTML = '<div class="dim-line">会话已删除, 新建一个开始</div>';
         }
         refreshSessions();
-      } catch (err) { alert("关闭失败: " + err.message); }
+      } catch (err) { alert("删除失败: " + err.message); }
     };
     box.appendChild(d);
   });
@@ -263,7 +272,9 @@ async function newSession() {
 }
 async function openSession(sid) {
   showView("chat");                  // 在别的页点会话: 先切回聊天页再打开
-  S.sid = sid; S.lastSeq = 0; S.streaming = null;
+  S.sid = sid; S.lastSeq = 0; S.streaming = null; S.archived = false;
+  $("arch-bar").hidden = true;
+  $("input").disabled = false;
   chat.innerHTML = ""; setBusy(false);
   renderConn("已连接", "ok");
   try {
@@ -276,6 +287,34 @@ async function openSession(sid) {
   openEvents();
   refreshSessions();
 }
+/* ---- E5 历史会话: 只读回放 + 一键续聊(同 sid 接着聊) ---- */
+async function openArchived(sid) {
+  showView("chat");
+  S.sid = sid; S.lastSeq = 0; S.streaming = null; S.archived = true;
+  if (S.es) { S.es.close(); S.es = null; }
+  chat.innerHTML = "";
+  setBusy(true);                     // 只读: 锁输入
+  $("input").disabled = true;
+  $("arch-bar").hidden = false;
+  $("arch-note").textContent = "历史会话(只读) · " + sid;
+  renderConn("已连接", "ok");
+  try {
+    const r = await api("/api/sessions/" + sid + "/messages");
+    (r.messages || []).forEach((m) => {
+      bubble(m.role === "user" ? "bubble-user" : "bubble-asst")
+        .textContent = m.content;
+    });
+    chat.scrollTop = chat.scrollHeight;
+  } catch (e) { addLine("✘ 读档失败: " + e.message, 1); }
+}
+$("arch-resume").onclick = async () => {
+  const model = $("model-sel").value;
+  if (!model) { alert("先在侧栏选一个模型, 再继续会话"); return; }
+  try {
+    const r = await api("/api/sessions", { model, resume: S.sid });
+    openSession(r.sid);              // 同一 sid, 这回是活的
+  } catch (e) { alert("续会话失败: " + e.message); }
+};
 async function loadModels() {
   const r = await api("/api/health");
   S.models = r.models || [];
@@ -331,14 +370,16 @@ function renderModelsList() {
 /* ---------------- 输入 ---------------- */
 function setBusy(busy) {
   if (busy !== undefined) S.busy = busy;
-  $("btn-stop").disabled = !S.busy;
+  $("btn-stop").disabled = !S.busy || !!S.archived;
+  $("btn-stop").textContent = "中断";
   $("btn-send").disabled = S.busy;
-  $("btn-send").textContent = S.busy ? "跑着…" : "发送";
+  $("btn-send").textContent = S.archived ? "只读" :
+    (S.busy ? "跑着…" : "发送");
 }
 async function send() {
   const ta = $("input");
   const text = ta.value.trim();
-  if (!text || !S.sid) return;
+  if (!text || !S.sid || S.archived) return;
   ta.value = "";
   try {
     await api("/api/sessions/" + S.sid + "/send", { text });
@@ -348,12 +389,17 @@ $("btn-send").onclick = send;
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
-$("btn-stop").onclick = () => S.sid &&
-  api("/api/sessions/" + S.sid + "/interrupt", {}).catch(() => {});
+$("btn-stop").onclick = () => {
+  if (!S.sid) return;
+  $("btn-stop").textContent = "中断中…";     // 先给反馈; turn_end 时 setBusy 复位
+  api("/api/sessions/" + S.sid + "/interrupt", {}).catch((e) =>
+    addLine("✘ 中断请求失败: " + e.message, 1));
+};
 $("btn-new").onclick = newSession;
 
-/* ---------------- 页面切换(会话/模型/忆库/技能/账本) ---------------- */
-const VIEWS = ["chat", "models", "memlib", "skills", "ledger", "admin"];
+/* ---------------- 页面切换(会话/模型/忆库/技能/账本/版本) ---------------- */
+const VIEWS = ["chat", "models", "memlib", "skills", "ledger", "versions",
+               "admin"];
 function showView(name) {
   VIEWS.forEach((v) => { $(v + "-view").hidden = v !== name; });
   document.querySelectorAll(".nav-btn").forEach((b) =>
@@ -361,6 +407,7 @@ function showView(name) {
   if (name === "memlib") loadMemlib();
   if (name === "skills") loadSkills();
   if (name === "ledger") loadLedger();
+  if (name === "versions") loadVersions();
   if (name === "admin") loadAdmin();
   if (name === "models") { loadModels().then(loadProviders); }
 }
@@ -564,6 +611,198 @@ $("m-save").onclick = async () => {
     $("m-msg").textContent = "已保存 " + r.label + " " + (r.key_mask || "");
     await loadModels();
   } catch (e) { $("m-msg").textContent = "失败: " + e.message; }
+};
+
+/* ---- E2 版本: 清单/建/切换(全局生效)/diff/超管删除 ---- */
+async function loadVersions() {
+  let r;
+  try { r = await api("/api/versions"); }
+  catch (e) { $("versions-list").innerHTML =
+    '<p class="dim">读取失败: ' + esc(e.message) + "</p>"; return; }
+  S.versions = r;
+  const box = $("versions-list");
+  box.innerHTML = "";
+  const on = r.online || {count: 0, users: []};
+  const onNote = "当前在线 " + (on.count || 0) + " 人" +
+    (on.busy_sessions ? " · " + on.busy_sessions + " 个回合在跑" : "");
+  (r.versions || []).forEach((v) => {
+    const d = document.createElement("div");
+    d.className = "vrow card";
+    const t = v.created_at ? new Date(v.created_at * 1000).toLocaleString(
+      "zh-CN", {hour12: false}) : "";
+    d.innerHTML =
+      '<div class="v-head"><b>' + esc(v.vid) + '</b>' +
+      '<span class="v-lab">' + esc(v.label || "(未命名)") + "</span>" +
+      (v.active ? '<span class="v-cur">当前</span>' : "") +
+      '<span class="v-meta">' + esc(v.created_by || "") + " · " + esc(t) +
+      " · " + (v.file_count || 0) + " 文件 / " +
+      Math.round((v.total_bytes || 0) / 1024) + " KB</span></div>" +
+      (v.note ? '<div class="v-note">' + esc(v.note) + "</div>" : "") +
+      '<div class="ops"></div>';
+    const ops = d.querySelector(".ops");
+    if (!v.active) {
+      const sw = document.createElement("button");
+      sw.className = "danger";
+      sw.textContent = "切换到此版本";
+      sw.onclick = async () => {
+        if (!confirm("切换到 " + v.vid + " ?\n\n" + onNote +
+            "\n全局生效: 所有人立即切到该版本, 服务闪断数秒。\n" +
+            "(切换前会自动快照当前状态, 可随时切回)")) return;
+        sw.disabled = true;
+        sw.textContent = "切换中…";
+        try {
+          const rr = await api("/api/versions/switch", {vid: v.vid});
+          alert("已切到 " + rr.vid + "(切换前预快照 " + rr.pre_snapshot +
+                ")。\n服务正在重启, 数秒后页面自动刷新。");
+          setTimeout(() => location.reload(), 2500);
+        } catch (e) {
+          alert("切换失败: " + e.message);
+          sw.disabled = false;
+          sw.textContent = "切换到此版本";
+        }
+      };
+      ops.appendChild(sw);
+    }
+    const df = document.createElement("button");
+    df.textContent = "diff";
+    df.onclick = () => showDiff(v.vid, r.versions || []);
+    ops.appendChild(df);
+    if (S.me && S.me.role === "admin" && !v.active) {
+      const del = document.createElement("button");
+      del.className = "danger";
+      del.textContent = "删除";
+      del.onclick = async () => {
+        if (!confirm("删除 " + v.vid +
+            " ?(进回收站 .trash 永不真删; 纪元首版/仅存版本/当前版本不可删)"))
+          return;
+        try {
+          await api("/api/versions", {vid: v.vid}, "DELETE");
+          loadVersions();
+        } catch (e) { alert(e.message); }
+      };
+      ops.appendChild(del);
+    }
+    box.appendChild(d);
+  });
+  if (!box.children.length)
+    box.innerHTML = '<p class="dim">还没有版本 —— 上面建第一个</p>';
+  $("v-merge-btn").hidden = !(S.me && S.me.role === "admin");
+  const fb = $("v-finalize-btn");
+  if (fb) fb.hidden = !(S.me && S.me.role === "admin");
+}
+async function showDiff(vid, all) {
+  const others = all.filter((v) => v.vid !== vid);
+  if (!others.length) { alert("没有别的版本可比"); return; }
+  const b = prompt("和哪个版本比? 输入版本号:", others[0].vid);
+  if (!b) return;
+  try {
+    const r = await api("/api/versions/diff?a=" +
+      encodeURIComponent(vid) + "&b=" + encodeURIComponent(b));
+    const box = $("version-diff");
+    box.hidden = false;
+    const c = r.counts || {};
+    const stLab = {added: "新增", removed: "移除", changed: "改动"};
+    let html = "<h4>" + esc(vid) + " → " + esc(b) + " · +" + (c.added || 0) +
+      " / -" + (c.removed || 0) + " / ~" + (c.changed || 0) +
+      "</h4><table><thead><tr><th>文件</th><th>状态</th><th>大小</th>" +
+      "</tr></thead><tbody>";
+    (r.files || []).forEach((f) => {
+      const sz = f.a ? f.a.bytes : f.b.bytes;
+      html += "<tr><td>" + esc(f.p) + "</td><td class='st-" + f.st + "'>" +
+        (stLab[f.st] || f.st) + "</td><td>" + sz + "B" +
+        (f.st === "changed" ? " → " + f.b.bytes + "B" : "") + "</td></tr>";
+    });
+    html += "</tbody></table>";
+    box.innerHTML = html;
+    box.scrollIntoView({behavior: "smooth"});
+  } catch (e) { alert("diff 失败: " + e.message); }
+}
+$("v-save").onclick = async () => {
+  try {
+    const r = await api("/api/versions", {
+      label: $("v-label").value.trim(), note: $("v-note").value.trim()});
+    $("v-msg").textContent = "已建 " + r.version.vid + " (" +
+      r.version.file_count + " 文件)";
+    $("v-label").value = "";
+    $("v-note").value = "";
+    loadVersions();
+  } catch (e) { $("v-msg").textContent = "失败: " + e.message; }
+};
+
+/* ---- E4 合并版本(超管): 挑 A/B 两版 → 逐文件挑边 → 合成全新版本 ---- */
+async function startMerge() {
+  const all = (S.versions && S.versions.versions) || [];
+  if (all.length < 2) { alert("至少要两个版本才能合并"); return; }
+  const a = prompt("合并 A 版(较旧一侧)版本号:", all[0].vid);
+  if (!a) return;
+  const b = prompt("合并 B 版(较新一侧, 冲突默认取 B)版本号:",
+    all[all.length - 1].vid);
+  if (!b) return;
+  if (b === a) { alert("两边不能是同一个版本"); return; }
+  let r;
+  try {
+    r = await api("/api/versions/diff?a=" + encodeURIComponent(a) +
+      "&b=" + encodeURIComponent(b));
+  } catch (e) { alert("diff 失败: " + e.message); return; }
+  const box = $("version-merge");
+  box.hidden = false;
+  const stLab = {added: "仅B有", removed: "仅A有", changed: "两边不同"};
+  let html = "<h4>合并 " + esc(a) + " + " + esc(b) +
+    " —— 冲突行挑一侧(默认 B), 单侧文件自动取所在侧</h4>" +
+    '<table><thead><tr><th>文件</th><th>情况</th><th>取侧</th></tr>' +
+    "</thead><tbody>";
+  (r.files || []).forEach((f, i) => {
+    html += "<tr><td>" + esc(f.p) + "</td><td class='st-" + f.st + "'>" +
+      (stLab[f.st] || f.st) + "</td><td>" +
+      (f.st === "changed"
+        ? '<label><input type="radio" name="mk' + i + '" value="a"> A</label> ' +
+          '<label><input type="radio" name="mk' + i + '" value="b" checked>' +
+          " B</label>"
+        : (f.st === "added" ? "B" : "A")) + "</td></tr>";
+  });
+  html += "</tbody></table>" +
+    '<div class="row"><input id="vm-label" placeholder="合并版名称">' +
+    '<button id="vm-go" class="primary">合并成新版本</button></div>' +
+    '<p class="dim">只读 A/B 两版, 产出一个全新版本; 不会自动切换, 想用就切过去。</p>';
+  box.innerHTML = html;
+  box.scrollIntoView({behavior: "smooth"});
+  $("vm-go").onclick = async () => {
+    const picks = {};
+    (r.files || []).forEach((f, i) => {
+      const sel = document.querySelector(
+        'input[name="mk' + i + '"]:checked');
+      if (sel) picks[f.p] = sel.value;
+    });
+    try {
+      const rr = await api("/api/versions/merge",
+        {a, b, label: $("vm-label").value.trim(), picks});
+      alert("已合并出新版本 " + rr.version.vid + " (" +
+        rr.version.file_count + " 文件)。要启用就切过去。");
+      box.hidden = true;
+      loadVersions();
+    } catch (e) { alert("合并失败: " + e.message); }
+  };
+}
+$("v-merge-btn").onclick = () => startMerge();
+
+/* ---- E4.1 定型(舾装, 超管): 旧版本+回收站归档, 当前工作区定为新基线 v0001 ---- */
+// null 守卫: index.html 旧缓存时按钮不存在, 不能炸掉整页脚本(2026-10-20 实弹)
+if ($("v-finalize-btn")) $("v-finalize-btn").onclick = async () => {
+  const okc = confirm(
+    "定型(舾装)?\n\n" +
+    "1. 全部旧版本 + 回收站整体归档, 清单只剩新基线 v0001;\n" +
+    "2. 归档后旧版本不可再切换/回退(这正是定型的含义);\n" +
+    "3. 当前**运行中的工作区状态**被定为新基线 v0001;\n" +
+    "4. 归档目录留在服务器 versions/archive/, 永不真删, 手工可救。");
+  if (!okc) return;
+  const lab = prompt("新基线名称(可空, 默认「定型」):", "定型");
+  if (lab === null) return;
+  try {
+    const r = await api("/api/versions/finalize", {label: lab});
+    alert("已定型: 新基线 " + r.version.vid +
+      "\n归档 " + r.version.archived + " 项 → " + r.version.archive);
+    loadVersions();
+  } catch (e) { alert("定型失败: " + e.message); }
 };
 
 /* ---------------- 连接配置 ---------------- */

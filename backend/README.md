@@ -52,3 +52,20 @@ python server.py --check
   `ProxyHandler({})` 的 opener（内置 selfcheck 已这么干）。浏览器访问 localhost
   默认绕代理, 网页端不受影响。
 - 端口被占: `--port` 换一个。
+
+## E2 版本系统(2026-10-19)
+
+- `version.py`: backend 全目录快照 → `versions/<vid>/files/` + `manifest.json`
+  (逐文件 sha1); 登记进 webusers 库(versions 表, sqlite/PG 同源)。
+- 端点: `GET /api/versions`(清单+当前+在线) · `POST /api/versions` 建版本
+  (任何登录用户) · `GET /api/versions/diff?a=&b=` 逐文件 diff ·
+  `POST /api/versions/switch {vid}` 切换(**全局生效**, 滚前自动快照,
+  覆盖工作区只覆盖永不删除, 触发 AT_RESTART_CMD 重启) ·
+  `DELETE /api/versions {vid}` 删除(仅超管, 进 `.trash` 永不真删,
+  纪元首版/仅存/当前激活不可删, 号不回收)。
+- env: `AT_VERSIONS_DIR`(默认 backend 上一级 versions/) ·
+  `AT_BACKEND_ROOT`(自检沙箱) · `AT_RESTART_CMD`(生产=
+  `sudo -n systemctl restart atweb`, 须配 sudoers, 见 DEPLOY.md)。
+- 自检 ⑰⑱ 含沙箱断言: BACKEND_ROOT 不在临时目录内直接拒绝跑
+  (坑: server 以 __main__ 起跑会缓存真实路径的 version 模块,
+  env 晚设无效 —— selfcheck 里改绑模块属性, 2026-10-19 写穿过一次后修)。

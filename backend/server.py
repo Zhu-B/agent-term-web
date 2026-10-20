@@ -71,6 +71,7 @@ import session as session_mod
 import skills as skills_mod
 import tools
 import webusers
+import version as version_mod     # E2: 版本系统(须在 webusers 后)
 from provider import ChatResult   # noqa: E402
 
 os.chdir(HERE)                    # run/sessions、run/trace 落在 backend/ 下
@@ -303,7 +304,7 @@ def model_catalog():
             if p.available:
                 out.append({"label": name, "model": p.model, "available": True,
                             "kind": "custom", "base_url": p.base_url,
-                            "key_mask": _mask(p.key)})
+                            "key_mask": _mask(p.key), "vision": bool(p.vision)})
             continue
         ok, src = _family_available(p, uid)   # 官方家: 默认档 + 家内档
         if not ok:
@@ -311,12 +312,13 @@ def model_catalog():
         base = {"available": True, "kind": "family", "base_url": p.base_url,
                 "key_mask": _mask(p.key if src == "公共"
                                   else _private_key(uid, name)),
-                "key_src": src}
+                "key_src": src, "vision": bool(p.vision)}
         out.append(dict(base, label="%s/%s" % (name, p.model), model=p.model))
         for m in provider_mod.load_models():  # 家内档(精确型号, 用户档合并版)
             if m.get("provider") == name and m.get("model") != p.model:
                 out.append(dict(base, label="%s/%s" % (name, m["model"]),
-                                model=m["model"]))
+                                model=m["model"],
+                                vision=bool(m.get("vision"))))
     return out
 
 
@@ -341,7 +343,38 @@ def resolve_model(label):
         k = _private_key(uid, p.name)
         if k:
             p.key, p.available, p.key_from_store = k, True, True
+    for m in provider_mod.load_models():   # 条目能力位(2026-10-20 识图接线):
+        if m.get("provider") == p.name and m.get("model") == p.model:
+            p.vision = bool(m.get("vision"))   # 家内档勾「能看图」在这里生效
+            break
     return p if p.available else None
+
+
+def _post_model_vision(body):
+    """「能看图」勾选/取消(2026-10-20): 定位条目改 vision 位存档(公共/私有按身份,
+    与 _post_model 同口径). 家内档条目不存在时顺手新建 {provider,model,vision};
+    自增档 label 找不到报错."""
+    label = str(body.get("label") or "").strip()
+    fam = str(body.get("provider") or "").strip()
+    model = str(body.get("model") or "").strip()
+    vision = bool(body.get("vision"))
+    ms = provider_mod.load_models()
+    for m in ms:
+        if fam and fam != "custom":
+            if m.get("provider") == fam and m.get("model") == model:
+                m["vision"] = vision
+                provider_mod.save_models(ms)
+                return True, {"label": "%s/%s" % (fam, model),
+                              "vision": vision}
+        elif label and m.get("provider") == "custom" and m.get("label") == label:
+            m["vision"] = vision
+            provider_mod.save_models(ms)
+            return True, {"label": label, "vision": vision}
+    if fam and fam != "custom" and model:      # 官方家默认档没有条目: 新建一条
+        ms.append({"provider": fam, "model": model, "vision": vision})
+        provider_mod.save_models(ms)
+        return True, {"label": "%s/%s" % (fam, model), "vision": vision}
+    return False, "条目不在模型档里 —— 先去模型页把它加进清单, 再勾「能看图」"
 
 
 # ================================ 事件投影(SSE 形) ================================
@@ -363,9 +396,14 @@ def project_web(ev):
             return {"type": "sub_tool_call", "sid": sid, "label": lb,
                     "name": d.get("name"), "args": (d.get("args_raw") or "")[:120]}
         if t == "tool_result":
-            return {"type": "sub_tool_result", "sid": sid, "label": lb,
-                    "ok": bool(d.get("ok")), "ms": d.get("duration_ms"),
-                    "content": (d.get("_content") or "")[:200]}
+            p = {"type": "sub_tool_result", "sid": sid, "label": lb,
+                 "ok": bool(d.get("ok")), "ms": d.get("duration_ms"),
+                 "content": (d.get("_content") or "")[:200]}
+            if d.get("images"):            # 2026-10-20: 识图结果上图进流
+                p["images"] = [{"path": r.get("path"), "sha1": r.get("sha1"),
+                                "bytes": r.get("bytes")}
+                               for r in d["images"][:4]]
+            return p
         if t == "turn_end":
             return {"type": "sub_done", "sid": sid, "label": lb,
                     "iters": d.get("iterations"), "aborted": bool(d.get("aborted"))}
@@ -435,6 +473,8 @@ class Sess:
         self.pending = {}                 # ask_id -> {kind, ev, answer}
         self.busy = False
         self.last_touch = time.time()
+        if uid is not None:               # E5: 归档归属(重启后仍能按人过滤)
+            app.session.meta(uid=uid)
         app.subscribe(self._sink)
 
     # ---- sink: 事件 → 投影 → 缓冲 + 广播(worker 线程调, 只做入队) ----
@@ -529,6 +569,102 @@ class Sess:
         return out
 
 
+# ---- E5 持久历史: 归档 transcript 只读扫描(不占句柄, 不写入) ----
+_ARCH_CACHE = (0.0, {})
+
+
+def _archived_index():
+    """run/sessions/*.jsonl → {sid: {uid, label, msgs, mtime}}.
+    归档扫描有 3s 缓存, 侧栏 8s 轮询不致反复读盘."""
+    global _ARCH_CACHE
+    now, cached = _ARCH_CACHE
+    if time.time() - now < 3 and cached:
+        return cached
+    out = {}
+    try:
+        files = sorted((fn for fn in os.listdir(session_mod.SESSIONS_DIR)
+                        if fn.endswith(".jsonl")), reverse=True)
+    except OSError:
+        files = []
+    for fn in files[:100]:                # 最新 100 个, 个人规模够用
+        sid = fn[:-6]
+        path = os.path.join(session_mod.SESSIONS_DIR, fn)
+        uid, first_user, n = None, "", 0
+        try:
+            with open(path, encoding="utf-8") as f:
+                for ln in f:
+                    try:
+                        row = json.loads(ln)
+                    except Exception:
+                        continue
+                    if row.get("kind") == "meta":
+                        u = (row.get("obj") or {}).get("uid")
+                        if u:
+                            uid = u
+                    elif row.get("kind") == "message":
+                        o = row.get("obj") or {}
+                        n += 1
+                        if not first_user and o.get("role") == "user" \
+                                and isinstance(o.get("content"), str):
+                            first_user = o["content"][:40]
+        except OSError:
+            continue
+        out[sid] = {"uid": uid,
+                    "label": first_user or "(空会话)",
+                    "msgs": n, "mtime": int(os.path.getmtime(path))}
+    _ARCH_CACHE = (time.time(), out)
+    return out
+
+
+def _archived_owner(sid):
+    return _archived_index().get(sid, {}).get("uid", "?")   # ? = 没这档
+
+
+def _archived_messages(sid):
+    """归档会话的平铺回放(与 Sess.history 同口径)."""
+    path = os.path.join(session_mod.SESSIONS_DIR, sid + ".jsonl")
+    if not os.path.isfile(path) or "/" in sid:
+        return None
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for ln in f:
+            try:
+                row = json.loads(ln)
+            except Exception:
+                continue
+            if row.get("kind") != "message":
+                continue
+            m = row.get("obj") or {}
+            role, c = m.get("role"), m.get("content")
+            if role in ("user", "assistant") and isinstance(c, str) and c.strip():
+                out.append({"role": role, "content": c[:8000]})
+    return out
+
+
+def _purge_session_files(sid):
+    """E5.1 真删: 会话 jsonl + trace jsonl 一起除(防重启后归档复活)."""
+    if not re.match(r"^s[0-9A-Za-z_.-]+$", sid):
+        return False
+    n = 0
+    for d in (session_mod.SESSIONS_DIR, instr.TRACE_DIR):
+        try:
+            p = os.path.join(d, sid + ".jsonl")
+            if os.path.isfile(p):
+                os.remove(p)
+                n += 1
+        except OSError:
+            pass
+    return n > 0
+
+
+def _archived_delete(sid):
+    """E5.1 删除归档会话: 真删磁盘档 + 立刻刷归档缓存."""
+    global _ARCH_CACHE
+    ok = _purge_session_files(sid)
+    _ARCH_CACHE = (0.0, {})
+    return ok
+
+
 class Hub:
     """全部 Web 会话的名册 + 逐出."""
 
@@ -543,7 +679,7 @@ class Hub:
             s.last_touch = time.time()
         return s
 
-    def create(self, label, uid=None):
+    def create(self, label, uid=None, resume=""):
         prov = resolve_model(label)
         if prov is None:
             return None, "模型 %r 不可用 —— 去 /api/models 看清单或先加自增档" % label
@@ -554,7 +690,31 @@ class Hub:
                 threading.Thread(target=old.app.shutdown, daemon=True).start()
         app = driver.AgentApp(prov, cwd=HERE, quiet=True, mode="web",
                               stream=True, auto_memory=True,
-                              perms=perms_mod.Perms(ask_fn=None, auto="deny"))
+                              perms=perms_mod.Perms(ask_fn=None, auto="deny"),
+                              # 2026-10-20 识图接线: 点名模型/候选回喂/视觉档清单
+                              # (worker 线程已 set_user, model_catalog 读得对人)
+                              sub_provider_fn=resolve_model,
+                              sub_models=lambda: [m["label"]
+                                                  for m in model_catalog()],
+                              sub_vision_models=lambda: [m["label"] for m
+                                  in model_catalog() if m.get("vision")],
+                              sub_allow_other=True)
+        if resume:                         # E5: 续归档会话(同一 jsonl 继续 append)
+            fresh_path = app.session.path
+            sess_r, err = app.resume(resume)
+            if sess_r is None:
+                try:
+                    app.shutdown()
+                except Exception:
+                    pass
+                return None, "续会话失败: %s" % err
+            if fresh_path != app.session.path:
+                try:
+                    os.remove(fresh_path)  # 刚装配产生的空 transcript, 清掉
+                except OSError:
+                    pass
+            if uid is not None:
+                app.session.meta(uid=uid)
         s = Sess(app, uid)
         app.perms.ask_fn = s.ask_perm     # perms 实例同一只, loop 侧即时生效
         app.ask_user = s.ask_user         # 双份挂(resume/clear 重建 loop 时带上)
@@ -563,23 +723,50 @@ class Hub:
             self.sessions[s.sid] = s
         return s, None
 
-    def drop(self, sid):
+    def drop(self, sid, purge=False):
         with self.lock:
             s = self.sessions.pop(sid, None)
         if s is not None:
-            threading.Thread(target=s.app.shutdown, daemon=True).start()
+            def _fin():
+                s.app.shutdown()
+                if purge:              # E5.1: 真删磁盘档(收尾后删, 不竞态)
+                    _purge_session_files(sid)
+            threading.Thread(target=_fin, daemon=True).start()
         return s is not None
 
     def list(self, uid=None, admin=False):
         with self.lock:
             items = [{"sid": s.sid, "label": s.label, "busy": s.busy,
-                      "owner": s.uid, "touch": int(s.last_touch)}
+                      "owner": s.uid, "touch": int(s.last_touch),
+                      "archived": False}
                      for s in self.sessions.values()
                      if admin or s.uid == uid]
+        # E5 持久历史: 磁盘上的归档 transcript(进程重启后仍可见/可回放/可续)
+        live = {i["sid"] for i in items}
+        for sid, meta in _archived_index().items():
+            if sid in live or not (admin or meta["uid"] in (uid, None)):
+                continue
+            if meta["uid"] is None and not admin:
+                continue                  # 无归属的老档: 只有超管看得见
+            items.append({"sid": sid, "label": meta["label"], "busy": False,
+                          "owner": meta["uid"], "touch": meta["mtime"],
+                          "msgs": meta["msgs"], "archived": True})
         return sorted(items, key=lambda x: -x["touch"])
 
 
 HUB = Hub()
+
+# E2: 当前在线(开着 SSE 流的连接) —— 切版本前给用户看的底线安全网.
+ONLINE = {}
+_online_lock = threading.Lock()
+
+
+def _online_users():
+    with _online_lock:
+        names = sorted({n for n in ONLINE.values() if n})
+    with HUB.lock:
+        busy = sum(1 for s in HUB.sessions.values() if s.busy)
+    return {"users": names, "count": len(names), "busy_sessions": busy}
 
 
 # ================================ HTTP ================================
@@ -656,8 +843,41 @@ class Handler(BaseHTTPRequestHandler):
             if user is None:
                 return self._json(401, {"ok": False, "err": "令牌无效或未登录"})
             set_user(user.get("uid"))     # 本线程的 core 分域上下文
+            m = re.match(r"^/api/media/([0-9a-f]{40})$", path)   # 2026-10-20:
+            if m:                                             # 媒体池读图
+                return self._media(m.group(1))
             return self._api_get(path, urllib.parse.parse_qs(u.query), user)
         return self._static(path)
+
+    def _media(self, sha1):
+        """媒体池文件 → 内联二进制(聊天流缩略图走这; <img> 带不了头, token 走
+        查询串 —— _authed 已兼容). sha1 白名单正则, 无目录穿越面."""
+        mdir = instr.media_dir()
+        try:
+            names = os.listdir(mdir)
+        except OSError:
+            names = []
+        for name in sorted(names):
+            if not name.startswith(sha1 + "."):
+                continue
+            ext = name.rsplit(".", 1)[-1].lower()
+            mime = {"png": "image/png", "jpg": "image/jpeg",
+                    "jpeg": "image/jpeg", "webp": "image/webp",
+                    "gif": "image/gif"}.get(ext, "application/octet-stream")
+            try:
+                with open(os.path.join(mdir, name), "rb") as f:
+                    raw = f.read()
+            except OSError:
+                break
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "private, max-age=86400")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        return self._json(404, {"ok": False, "err": "没有这个媒体文件"})
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
@@ -703,12 +923,52 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(403, {"ok": False, "err": "不是你的会话"})
             return self._json(200, {"ok": s.answer(m.group(2), body)})
         if u.path == "/api/sessions":
-            s, err = HUB.create(str(body.get("model") or ""), user.get("uid"))
+            resume = str(body.get("resume") or "").strip()
+            if resume:
+                live_s = HUB.get(resume)           # 已经活着: 直接复用
+                if live_s is not None:
+                    if not self._own(live_s, user):
+                        return self._json(403, {"ok": False,
+                                                "err": "不是你的会话"})
+                    return self._json(200, {"ok": True, "sid": live_s.sid,
+                                            "label": live_s.label,
+                                            "resumed": True})
+                if user.get("role") != "admin":
+                    owner = _archived_owner(resume)    # 越权拦截在装配之前
+                    if owner != user.get("uid"):
+                        return self._json(403, {"ok": False,
+                                                "err": "不是你的会话"})
+            s, err = HUB.create(str(body.get("model") or ""),
+                                user.get("uid"), resume=resume)
             if s is None:
                 return self._json(400, {"ok": False, "err": err})
-            return self._json(200, {"ok": True, "sid": s.sid, "label": s.label})
+            return self._json(200, {"ok": True, "sid": s.sid, "label": s.label,
+                                    "resumed": bool(resume)})
         if u.path == "/api/models":
             return self._post_model(body, user)
+        if u.path == "/api/models/vision":    # 2026-10-20: 「能看图」勾选
+            try:
+                ok, r = _post_model_vision(body)
+            except Exception as ex:
+                ok, r = False, "vision 异常: %r" % ex
+            return self._json(200 if ok else 404,
+                              dict({"ok": ok},
+                                   **({"model": r} if ok else {"err": r})))
+        if u.path == "/api/memory/zone":      # 2026-10-20: 遗忘/恢复(两区挪动)
+            title = str(body.get("title") or "").strip()
+            to = str(body.get("to") or "forget").strip()
+            if not title or to not in ("archive", "forget"):
+                return self._json(400, {"ok": False, "err": "title/to 不对"})
+            cur = memory_mod.find_zone(title)
+            if not cur:
+                return self._json(404, {"ok": False, "err": "没有这张卡"})
+            if cur == to:
+                return self._json(200, {"ok": True, "zone": cur,
+                                        "note": "已在该区"})
+            final = memory_mod.move_zone(title, cur, to)
+            if not final:
+                return self._json(400, {"ok": False, "err": "挪区失败(同名冲突?)"})
+            return self._json(200, {"ok": True, "zone": to, "title": final})
         if u.path == "/api/providers/key":     # E1.2: 家 key(超管=公共/用户=私有)
             name = str(body.get("name") or "").strip()
             key = str(body.get("key") or "").strip()
@@ -770,6 +1030,53 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "err": "op 不认识"})
             return self._json(200 if ok else 400,
                               dict({"ok": ok}, **(r if ok else {"err": r})))
+        if u.path == "/api/versions":               # E2: 建版本(任何登录用户)
+            try:
+                ok, r = version_mod.create(str(body.get("label") or ""),
+                                           str(body.get("note") or ""),
+                                           user.get("username") or "?")
+            except Exception as ex:
+                ok, r = False, "建版本异常: %r" % ex
+            return self._json(200 if ok else 400,
+                              dict({"ok": ok},
+                                   **({"version": r} if ok else {"err": r})))
+        if u.path == "/api/versions/switch":        # E2: 切版本(全员可切,
+            vid = str(body.get("vid") or "").strip()  # 全局生效, 审计记操作者)
+            try:
+                ok, r = version_mod.switch_to(vid,
+                                              user.get("username") or "?")
+            except Exception as ex:
+                ok, r = False, "切换异常: %r" % ex
+            return self._json(200 if ok else 400,
+                              dict({"ok": ok}, **(r if ok else {"err": r})))
+        if u.path == "/api/versions/merge":         # E4: 合并(仅超管, 逐文件
+            if user.get("role") != "admin":         # 挑 A/B 合成全新版本)
+                return self._json(403, {"ok": False, "err": "仅超管可合并版本"})
+            picks = body.get("picks")
+            picks = picks if isinstance(picks, dict) else {}
+            try:
+                ok, r = version_mod.merge(str(body.get("a") or "").strip(),
+                                          str(body.get("b") or "").strip(),
+                                          str(body.get("label") or ""),
+                                          str(body.get("note") or ""),
+                                          user.get("username") or "?", picks)
+            except Exception as ex:
+                ok, r = False, "合并异常: %r" % ex
+            return self._json(200 if ok else 400,
+                              dict({"ok": ok},
+                                   **({"version": r} if ok else {"err": r})))
+        if u.path == "/api/versions/finalize":  # E4.1: 定型(仅超管; 全部旧
+            if user.get("role") != "admin":     # 版本+回收站归档, 当前工作区
+                return self._json(403, {"ok": False, "err": "仅超管可定型"})
+            try:
+                ok, r = version_mod.finalize(str(body.get("label") or ""),
+                                             str(body.get("note") or ""),
+                                             user.get("username") or "?")
+            except Exception as ex:
+                ok, r = False, "定型异常: %r" % ex
+            return self._json(200 if ok else 400,
+                              dict({"ok": ok},
+                                   **({"version": r} if ok else {"err": r})))
         return self._json(404, {"ok": False, "err": "unknown endpoint"})
 
     def do_DELETE(self):
@@ -783,7 +1090,14 @@ class Handler(BaseHTTPRequestHandler):
             s = HUB.get(m.group(1))
             if s is not None and not self._own(s, user):
                 return self._json(403, {"ok": False, "err": "不是你的会话"})
-            return self._json(200, {"ok": HUB.drop(m.group(1))})
+            if s is None:               # E5.1: 归档会话真删(磁盘档+越权拦截)
+                owner = _archived_owner(m.group(1))
+                if owner == "?":
+                    return self._json(404, {"ok": False, "err": "会话不存在"})
+                if user.get("role") != "admin" and owner != user.get("uid"):
+                    return self._json(403, {"ok": False, "err": "不是你的会话"})
+                return self._json(200, {"ok": _archived_delete(m.group(1))})
+            return self._json(200, {"ok": HUB.drop(m.group(1), purge=True)})
         if u.path == "/api/models":       # E1.4: 删已加入的模型档
             body = self._body()
             label = str(body.get("label") or "").strip()
@@ -802,6 +1116,26 @@ class Handler(BaseHTTPRequestHandler):
             webusers.audit(user.get("username"), "model_delete",
                            label or "%s/%s" % (fam, model))
             return self._json(200, {"ok": True})
+        if u.path == "/api/memory/card":       # 2026-10-20: 删记忆卡(真删)
+            body = self._body()
+            title = str(body.get("title") or "").strip()
+            if not title:
+                return self._json(400, {"ok": False, "err": "缺 title"})
+            z = memory_mod.find_zone(title)
+            if not z:
+                return self._json(404, {"ok": False, "err": "没有这张卡"})
+            memory_mod.delete_card(title, zone=z)
+            return self._json(200, {"ok": True})
+        if u.path == "/api/versions":       # E2: 删版本(仅超管, 进 .trash)
+            if user.get("role") != "admin":
+                return self._json(403, {"ok": False, "err": "仅超管可删版本"})
+            body = self._body()
+            try:
+                ok, r = version_mod.delete(str(body.get("vid") or "").strip())
+            except Exception as ex:
+                ok, r = False, "删除异常: %r" % ex
+            return self._json(200 if ok else 400,
+                              dict({"ok": ok}, **(r if ok else {"err": r})))
         return self._json(404, {"ok": False, "err": "unknown endpoint"})
 
     # ---- API 实现 ----
@@ -830,8 +1164,20 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/sessions/([^/]+)/(messages|events)$", path)
         if m:
             s = HUB.get(m.group(1))
-            if s is None:
-                return self._json(404, {"ok": False, "err": "会话不存在(可能已重启)"})
+            if s is None:                       # E5: 归档会话 → 磁盘回放
+                if m.group(2) != "messages":
+                    return self._json(404, {"ok": False,
+                                            "err": "归档会话没有实时流, 先「继续」"})
+                owner = _archived_owner(m.group(1))
+                if owner == "?":
+                    return self._json(404, {"ok": False, "err": "会话不存在"})
+                if user.get("role") != "admin" and owner != user.get("uid"):
+                    return self._json(403, {"ok": False, "err": "不是你的会话"})
+                msgs = _archived_messages(m.group(1))
+                if msgs is None:
+                    return self._json(404, {"ok": False, "err": "会话不存在"})
+                return self._json(200, {"ok": True, "messages": msgs,
+                                        "archived": True})
             if not self._own(s, user):
                 return self._json(403, {"ok": False, "err": "不是你的会话"})
             if m.group(2) == "messages":
@@ -895,6 +1241,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True,
                                     "entries": ledger_mod.list_entries(limit),
                                     "aggregate": ledger_mod.aggregate()})
+        if path == "/api/versions":        # E2: 清单 + 当前 + 在线(切前安全网)
+            return self._json(200, {"ok": True,
+                                    "versions": version_mod.listing(),
+                                    "active": version_mod.active_version(),
+                                    "online": _online_users()})
+        if path == "/api/versions/diff":   # E2: 事无巨细逐文件 diff
+            ok, r = version_mod.diff((q.get("a") or [""])[0].strip(),
+                                     (q.get("b") or [""])[0].strip())
+            return self._json(200 if ok else 404,
+                              dict({"ok": ok}, **(r if ok else {"err": r})))
         return self._json(404, {"ok": False, "err": "unknown endpoint"})
 
     def _send(self, s, body):
@@ -937,7 +1293,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "err": "缺 model"})
             ms = [m for m in provider_mod.load_models()
                   if not (m.get("provider") == fam and m.get("model") == model)]
-            ms.append({"provider": fam, "model": model})
+            entry = {"provider": fam, "model": model}
+            if body.get("vision"):
+                entry["vision"] = bool(body.get("vision"))
+            ms.append(entry)
             provider_mod.save_models(ms)
             return self._json(200, {"ok": True,
                                     "label": "%s/%s" % (fam, model),
@@ -984,6 +1343,9 @@ class Handler(BaseHTTPRequestHandler):
         with s.lock:
             replay = [e for e in s.buffer if e["seq"] > since]
             s.queues.append(out)
+        with _online_lock:                 # E2: 在线登记(SSE 断开即销)
+            ONLINE[id(self)] = (getattr(self, "_user_cache", None)
+                               or {}).get("username") or "?"
 
         def send(obj):
             self.wfile.write(("data: %s\n\n" % json.dumps(
@@ -1005,6 +1367,8 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
+            with _online_lock:
+                ONLINE.pop(id(self), None)
             with s.lock:
                 if out in s.queues:
                     s.queues.remove(out)

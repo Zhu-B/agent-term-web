@@ -1,9 +1,11 @@
 __pycache__/
 *.pyc
 backend/run/
+backend/core/run/
 backend/data/
 data/
 *.pem
 *.bak
 .DS_Store
 node_modules/
+versions/

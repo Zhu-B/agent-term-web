@@ -510,7 +510,9 @@ class AgentLoop:
         emitted = [0]                  # 已吐出的流式增量数
 
         def on_chunk(kind, text):
-            emitted[0] += 1
+            if self.abort.stop:          # 中断逃生口(2026-10-20): 流式半途拔线
+                raise KeyboardInterrupt()  # —— KI 是 BaseException, provider 的
+            emitted[0] += 1              # except Exception 吞不掉, run_turn 接住
             self.bus.emit("llm_chunk", kind=kind, text=text)
 
         for attempt in range(RETRIES + 1):
@@ -897,24 +899,27 @@ class AgentLoop:
         except Exception:
             return []
 
-    def _look_image_one(self, path, question, model=""):
-        """look_image 工具的执行: 本地图片 → 媒体池 ref → 单轮视觉调用(不带工具)
-        回传文字结论. 点名模型走分身解析器(同一道 sub_allow_other 门); 不点名用当前
-        档(须视觉档). M19 账本照挂 —— 跨模型花钱得留客观账."""
+    def _look_image_one(self, path, question, model="", frames=2):
+        """look_image 工具的执行: 本地图片/GIF/视频 → 媒体池 ref(s) → 单轮视觉调用
+        (不带工具)回传文字结论. GIF 动图/视频抽帧(≤2)+元数据织进问题. 点名模型走
+        分身解析器(同一道 sub_allow_other 门); 不点名用当前档(须视觉档).
+        M19 账本照挂 —— 跨模型花钱得留客观账."""
         if self.abort.stop:
             return tools.ToolRet(False, "父代理已中断, 识图未启动.")
-        ref = vision_mod.ref_from_path(tools._resolve(self.ctx, str(path or "")))
-        if ref is None:
+        refs, meta = vision_mod.refs_from_path(
+            tools._resolve(self.ctx, str(path or "")), frames=frames)
+        if refs is None:
             return tools.ToolRet(
-                False, "look_image: 读不到图片文件 %r —— 检查路径(相对路径相对当前"
-                       "工作目录; 截图/用户拖进来的图都是路径)." % path)
+                False, "look_image: 读不到 %r —— %s(检查路径: 相对路径相对当前"
+                       "工作目录; 截图/用户拖进来的图都是路径)." % (path, meta))
         prov, who = self.provider, "%s/%s" % (self.provider.name, self.provider.model)
         if model:
             fn = self.ctx.sub_provider_fn
             if fn is None:
                 return tools.ToolRet(
-                    False, "look_image: 本环境不支持点名识图模型(%r) —— 省略 model: 当前"
-                           "模型是视觉档就直接用它; 或到前端聊天窗里跑." % model)
+                    False, "look_image: 点名识图模型(%r) 解析不到 —— 省略 model: 当前"
+                           "模型是视觉档就直接用它; 或到「模型」页给视觉条目勾「能看图」"
+                           "再点名." % model)
             allow = self.ctx.sub_allow_other      # 与 spawn 同一道门(live callable)
             try:
                 allow = bool(allow() if callable(allow) else allow)
@@ -942,18 +947,21 @@ class AgentLoop:
                 "让用户在「模型」页给条目勾上「能看图」"
             return tools.ToolRet(
                 False, "look_image: 当前模型不是视觉档(没勾「能看图」), 图喂不进去 —— "
-                       "① spawn 带图派识图分身并点名视觉档 ② 换当前模型为视觉档. %s."
-                       % tail)
+                       "① 到「模型」页给视觉条目勾「能看图」再点名 model ② 换当前模型"
+                       "为视觉档. %s." % tail)
         t0 = time.time()
         looker = AgentLoop(
             prov, tools.build_registry(tools=[]), SubBusProxy(self.bus, "look", "识图"),
-            sysprompt="你是识图助手: 用户给一张图和一个问题, 只依据图与问题作答, 直接给"
-                      "结论(关键细节别漏, 不确定就说不确定).",
+            sysprompt="你是识图助手: 用户给一张或几张图/视频帧和一个问题, 只依据图与"
+                      "问题作答, 直接给结论(关键细节别漏, 不确定就说不确定).",
             max_iters=2, cwd=self.ctx.cwd, session=None,   # 不落 transcript, 不带工具
             perms=self.perms, knobs=self.knobs, stream=False, auto_memory=False,
             ask_user=None, platform=None, hooks=self.hooks)
+        if meta:                        # GIF 动图/视频: 元数据织进问题, 模型有上下文
+            question = "【媒体信息】%s\n%s" % (meta,
+                question or "描述这张图的内容.")
         try:
-            s = looker.run_turn(question or "描述这张图的内容.", images=[ref])
+            s = looker.run_turn(question or "描述这张图的内容.", images=refs)
         except Exception as ex:
             return tools.ToolRet(False, "look_image: 识图调用崩了: %s: %s"
                                        % (type(ex).__name__, ex))
@@ -986,7 +994,11 @@ class AgentLoop:
         if s.error:
             head += " · 出错: %s" % str(s.error)[:120]
         text = head + "\n—— 识图结论 ——\n" + (body or "(没有得出结论)")
-        return tools.ToolRet(ok, text[:SUB_RESULT_CAP], truncated=len(text) > SUB_RESULT_CAP)
+        if refs:                         # 2026-10-20: 告诉模型图已上流, 用户看得到
+            text += "\n(已附 %d 张图进聊天流, 用户侧已可见)" % len(refs)
+        return tools.ToolRet(ok, text[:SUB_RESULT_CAP],
+                             truncated=len(text) > SUB_RESULT_CAP,
+                             images=refs)   # 2026-10-20: 图随结论进聊天流
 
     def _gate_and_dispatch(self, name, args_raw):
         """M2 权限门: 过门才执行; 拒绝不是异常 —— 拒绝消息作为 error ToolRet 回喂模型自纠."""

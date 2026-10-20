@@ -20,6 +20,7 @@
       <button class="nav-btn" data-view="memlib">忆库</button>
       <button class="nav-btn" data-view="skills">技能</button>
       <button class="nav-btn" data-view="ledger">账本</button>
+      <button class="nav-btn" data-view="versions">版本</button>
       <button class="nav-btn" id="btn-admin" data-view="admin" hidden>管理</button>
       <button id="btn-cfg">⚙ 连接</button>
     </div>
@@ -94,6 +95,27 @@
           <th>结果</th><th>tokens</th><th>墙钟</th></tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+    <div id="versions-view" hidden>
+      <h2>版本(全局快照)</h2>
+      <p class="dim">每个版本 = 后端全目录快照(core+server)。切换<b>全局生效, 所有人立即切过去</b>, 服务闪断数秒后自动回来; 切换前会自动快照当前状态(永远有回头路)。删除仅超管, 进回收站永不真删; 纪元首版不可删。</p>
+      <div class="card form" style="max-width:460px">
+        <label>把当前工作区存为新版本: 名称</label>
+        <input id="v-label" placeholder="比如: 加了报表页">
+        <label>备注(可选)</label>
+        <input id="v-note" placeholder="改了什么, 为什么">
+        <div class="row">
+          <button id="v-save" class="primary">建版本</button>
+          <span id="v-msg" class="dim"></span>
+        </div>
+      </div>
+      <h3>版本清单</h3>
+      <div class="row" style="margin-top:10px">
+        <button id="v-merge-btn" hidden>合并版本(超管)</button>
+      </div>
+      <div id="versions-list"></div>
+      <div id="version-merge" class="card" hidden></div>
+      <div id="version-diff" class="card" hidden></div>
     </div>
     <div id="admin-view" hidden>
       <h2>管理(仅超管)</h2>

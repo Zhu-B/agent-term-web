@@ -89,3 +89,27 @@ cd ~/agent-term-web && sudo sh setup-server.sh 你的访问令牌
 **单独申请一把小额的**（别把主力 key 放公网机器）; ssh 改密钥登录。
 模型页存的 key 落在服务器 `~/.agent-term/models.json`——轻量服务器盘是持久的,
 **重启不丢, 重装系统才丢**（和免费托管平台的根本区别）。
+
+## E2 版本系统上线(切版本要能自动重启)
+
+```sh
+# ① 快照目录(atweb 用户可写, 树外, 不进 git)
+sudo mkdir -p /opt/agent-term-web/versions
+sudo chown atweb:atweb /opt/agent-term-web/versions
+
+# ② 让服务进程能自己重启(窄 sudoers, 只放行这一条命令)
+echo 'atweb ALL=(root) NOPASSWD: /usr/bin/systemctl restart atweb' \
+  | sudo tee /etc/sudoers.d/atweb-restart
+sudo chmod 440 /etc/sudoers.d/atweb-restart
+
+# ③ unit 加 env(改 /etc/systemd/system/atweb.service 的 [Service] 段)
+#   Environment=AT_RESTART_CMD=sudo -n systemctl restart atweb
+sudo systemctl daemon-reload && sudo systemctl restart atweb
+
+# ④ 建纪元基线 v0001(超管令牌在页面上点也行)
+curl -X POST http://127.0.0.1:8787/api/versions \
+  -H "Authorization: Bearer <令牌>" -d '{"label":"E2 基线","note":"上线首版"}'
+```
+
+不配 ②③ 也能用: 切版本会落盘+写 RESTART.marker, 但不自动重启,
+手动 `sudo systemctl restart atweb` 后生效。备份的 pg_backup.sh 不受影响。

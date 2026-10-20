@@ -650,10 +650,11 @@ TODO = {
 }
 
 
-# ------ Tool: memory(M9 记忆卡) ------
+# ------ Tool: memory(M9 记忆卡; 2026-10-20 起只存不读) ------
 def run_memory(args, ctx):
-    """跨会话共享记忆卡: list=列卡名+摘要, read=读一张(发 memory_read 事件,
-    UI 据此把该卡标成已读; trace 记账 = 记忆消费行为可回放). 只读, 免权限门."""
+    """跨会话共享记忆卡: list=列卡名+摘要(写卡查重/提醒用户注入用). 读内容不在这
+    工具里 —— 用户拍板"忆库只管存, 要用的时候在聊天里插卡": 卡内容只有用户点
+    「注入」进对话才可见. 只读, 免权限门."""
     import memory as memory_mod
     action = args.get("action", "list")
     if action == "list":
@@ -668,52 +669,24 @@ def run_memory(args, ctx):
                             c["size"], c["head"][:50]))
         return ToolRet(True, "\n".join(lines))
     if action == "read":
-        title = (args.get("title") or "").strip()
-        if not memory_mod.card_exists(title):
-            return ToolRet(False, "没有这张记忆卡: %r (先 action=list 看清单; "
-                                  "卡在 ~/.agent-term/memory/, 由用户在聊天窗左侧新建)"
-                           % title)
-        if ctx.ask_user is not None:
-            # M13.6 用户拍板: agent 读卡进上下文也要过用户那关(注入只会随对话压缩,
-            # 无法单独移除); 与手动点卡的"注入不可撤销"提示同一口径. 拒绝=不读不标已读.
-            ans = _ask_via_ui(
-                ctx, "agent 想把「%s」读进本对话 —— 卡内容会进入上下文"
-                     "(之后只能随对话一起压缩, 无法单独移除). 读吗?" % title,
-                "读取记忆卡",
-                [{"label": "读取注入", "description": "读完本会话就能用这张卡"},
-                 {"label": "不读", "description": "拒绝注入, 本会话看不到这张卡"}])
-            if ans is not None:
-                if ans["custom"]:
-                    return ToolRet(True, "用户没点选, 而是说: %s —— 按用户的意思办, 别硬读."
-                                   % ans["custom"])
-                if ans["skipped"] or ans["label"] != "读取注入":
-                    return ToolRet(True, "用户没让读这张卡 —— 别反复请求; "
-                                         "需要的话照用户的其它指示来.")
-        text = memory_mod.read_card(title)
-        if not text:
-            return ToolRet(False, "没有这张记忆卡: %r" % title)
-        if ctx.bus is not None:
-            ctx.bus.emit("memory_read", title=title)   # 用户点头后: 左栏标已读
-        return ToolRet(True, "【记忆卡·%s】\n%s" % (title, text))
-    return ToolRet(False, "action 只许 list/read, 收到 %r" % action)
+        return ToolRet(False, "忆库只存不读 —— 需要这张卡的内容时, 让用户在忆库页"
+                              "点「注入」把卡插进对话(或提醒用户去注入), 你不能自己读.")
+    return ToolRet(False, "action 只许 list, 收到 %r" % action)
 
 
 MEMORY = {
     "name": "memory",
-    "description": ("跨会话共享记忆卡: 存放持久事实/用户偏好/项目背景, 所有会话共用. "
-                    "涉及历史背景、既有约定或拿不准的偏好时, 先 action=list 看有哪些卡, "
-                    "再 action=read 读相关的卡; 记忆卡优先于你的猜测. 卡分留档区/遗忘区, "
-                    "两区都可读 —— 遗忘区的卡每逢周末自动清理, 长期事实以留档区为准. "
-                    "注意: read 会弹确认卡(读进上下文=不可单独移除), 用户可能拒绝 —— "
-                    "被拒别反复请求. 写入/更新用 memory_write 工具."),
+    "description": ("跨会话共享记忆卡清单(只存不读): action=list 列全部卡名+时间+摘要, "
+                    "用于写卡查重, 或发现与本任务有关的卡时提醒用户到忆库页点「注入」. "
+                    "卡内容不在这里读 —— 只有用户把卡注入对话后你才看得到. "
+                    "写入/更新用 memory_write 工具."),
     "input_schema": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["list", "read"],
-                       "description": "list=列全部卡片(卡名+时间+摘要); read=读指定一张"},
-            "title": {"type": "string", "description": "卡名(action=read 时必填, 见 list 结果)"},
+            "action": {"type": "string", "enum": ["list"],
+                       "description": "list=列全部卡片(卡名+时间+摘要)"},
         },
-        "required": ["action"],
+        "required": [],
     },
     "risk": "read",
     "run": run_memory,
@@ -1144,43 +1117,54 @@ SPAWN = {
 }
 
 
-# ------ Tool: look_image(识图单发; M32) ------
+# ------ Tool: look_image(识图单发; M32; 2026-10-20 起支持 GIF/视频) ------
 def run_look_image(args, ctx):
-    """壳: 校验入参 → loop 侧解析视觉档并单轮调用(本地图→结论文字)."""
+    """壳: 校验入参 → loop 侧解析视觉档并单轮调用(本地图/GIF/视频→结论文字)."""
     if ctx.look_image is None:
         return ToolRet(False, "本环境未启用识图 —— 让用户在「模型」页给条目勾上"
                               "「能看图」, 或换个环境跑.")
     path = str(args.get("path") or "").strip()
     if not path:
-        return ToolRet(False, "look_image: 缺 path(哪张图? 本地图片文件路径)")
+        return ToolRet(False, "look_image: 缺 path(哪张图? 本地图片/GIF/视频文件路径)")
     question = str(args.get("question") or "").strip()
     if not question:
         return ToolRet(False, "look_image: 缺 question(要看什么? 写具体: 读哪块文字/"
                               "数什么/对比什么)")
     model = str(args.get("model") or "").strip()
-    return ctx.look_image(path, question, model)
+    try:
+        frames = max(1, min(int(args.get("frames") or 2), 2))
+    except (TypeError, ValueError):
+        frames = 2
+    return ctx.look_image(path, question, model, frames)
 
 
 LOOK_IMAGE = {
     "name": "look_image",
     "description": (
-        "看一张本地图片, 回传文字结论(单次视觉调用, 不带工具不多轮): 适合读截图文字/"
-        "看图表/认界面元素这类一眼活. 复杂活(看完图还要查文件/多轮追问/对比多图)改用 "
-        "spawn 带 images 派识图分身. path 传本地图片路径(截图/用户拖进来的图); 当前模型"
-        "不是视觉档时点名 model=视觉档(家/型号), 或改走 spawn."),
+        "看本地图片/GIF/视频, 回传文字结论(单次视觉调用, 不带工具不多轮): 适合读截图"
+        "文字/看图表/认界面元素这类一眼活. 支持 png/jpg/webp/gif(动图自动抽帧)/常见"
+        "视频 mp4·webm·mov 等(抽帧+时长分辨率元数据, 需服务器装了 ffmpeg). 结果自动"
+        "附原图进聊天流 —— 用户能直接看到图, 你不用再想办法发图. 复杂活(看完"
+        "图还要查文件/多轮追问/对比多图)改用 spawn 带 images 派识图分身. path 传本地"
+        "文件路径(截图/用户拖进来的图); 当前模型不是视觉档时点名 model=视觉档(家/型号),"
+        " 或改走 spawn."),
     "input_schema": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "本地图片文件路径"},
+            "path": {"type": "string",
+                     "description": "本地图片/GIF/视频文件路径(png/jpg/webp/gif/"
+                                    "mp4/webm/mov 等)"},
             "question": {"type": "string",
                          "description": "要看什么(写具体: 读哪块文字/数什么/对比什么)"},
             "model": {"type": "string",
                       "description": "可选: 点名视觉档模型(家/型号); 当前模型是视觉档"
                                      "可省略; 受「分身用非当前模型」开关管"},
+            "frames": {"type": "integer",
+                       "description": "可选: GIF 动图/视频抽几帧(1-2, 默认 2)"},
         },
         "required": ["path", "question"],
     },
-    "risk": "read",   # 只读一张图+一次推理; 跨模型花钱留账本(M19)
+    "risk": "read",   # 只读图/视频抽帧+一次推理; 跨模型花钱留账本(M19)
     "run": run_look_image,
 }
 

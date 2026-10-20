@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS users(
 CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, actor TEXT,
   action TEXT, detail TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS versions(          -- E2: 版本登记(快照文件在
+  vid TEXT PRIMARY KEY, label TEXT DEFAULT '', -- versions/<vid>/, 树外)
+  note TEXT DEFAULT '', created_by TEXT DEFAULT '',
+  created_at REAL DEFAULT 0, file_count INTEGER DEFAULT 0,
+  total_bytes INTEGER DEFAULT 0, trashed INTEGER DEFAULT 0);
 """
 SCHEMA_PG = """
 CREATE TABLE IF NOT EXISTS users(
@@ -48,6 +53,11 @@ CREATE TABLE IF NOT EXISTS users(
 CREATE TABLE IF NOT EXISTS audit(
   id BIGSERIAL PRIMARY KEY, ts REAL, actor TEXT,
   action TEXT, detail TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS versions(
+  vid TEXT PRIMARY KEY, label TEXT DEFAULT '',
+  note TEXT DEFAULT '', created_by TEXT DEFAULT '',
+  created_at REAL DEFAULT 0, file_count INTEGER DEFAULT 0,
+  total_bytes INTEGER DEFAULT 0, trashed INTEGER DEFAULT 0);
 """
 _schema_ready = False
 
