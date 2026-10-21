@@ -102,7 +102,8 @@ class AgentApp:
                                     sub_vision_models=self.sub_vision_models)
 
     def _base_sinks(self):
-        sinks = [instr.raw_store_sink(), instr.jsonl_sink(self.trace_path)]
+        self._trace_sink = instr.jsonl_sink(self.trace_path)   # E5.1: 留句柄, 收尾时关
+        sinks = [instr.raw_store_sink(), self._trace_sink]
         if not self.quiet:
             sinks.append(instr.plain_sink() if self.plain else tui.render_sink())
         return sinks
@@ -130,6 +131,10 @@ class AgentApp:
                 pass
         try:
             self.session.close()
+        except Exception:
+            pass
+        try:                                # E5.1: 关 trace 句柄(否则 Windows 删不掉档)
+            getattr(self, "_trace_sink", None).close()
         except Exception:
             pass
 
@@ -175,13 +180,13 @@ class AgentApp:
             if len(hits) > 1:
                 return None, "前缀 %r 命中 %d 个, 再补长一点: %s" % (
                     prefix, len(hits), ", ".join(f[:-6] for f in hits))
-            path = os.path.join(session_mod.SESSIONS_DIR, hits[0])
+            path = os.path.join(session_mod.sessions_dir(), hits[0])
         else:
             cur = os.path.basename(self.session.path)
             cands = [f for f in files if f != cur] or files
             if not cands:
                 return None, "没有别的可续会话"
-            path = os.path.join(session_mod.SESSIONS_DIR, cands[-1])
+            path = os.path.join(session_mod.sessions_dir(), cands[-1])
         try:
             self.session.close()
         except Exception:
@@ -208,7 +213,7 @@ class AgentApp:
         rows = []
         cur_sid = self.session.sid
         for fn in reversed(self.session_files()[:limit]):
-            path = os.path.join(session_mod.SESSIONS_DIR, fn)
+            path = os.path.join(session_mod.sessions_dir(), fn)
             sid = fn[:-6]
             n_msgs = 0
             provider = model = ""
@@ -242,7 +247,7 @@ class AgentApp:
     @staticmethod
     def session_files():
         try:
-            return sorted(f for f in os.listdir(session_mod.SESSIONS_DIR)
+            return sorted(f for f in os.listdir(session_mod.sessions_dir())
                           if f.endswith(".jsonl"))
         except OSError:
             return []

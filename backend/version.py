@@ -31,6 +31,7 @@ BACKEND_ROOT = os.environ.get("AT_BACKEND_ROOT") or HERE
 RESTART_CMD = os.environ.get("AT_RESTART_CMD", "").strip()
 ACTIVE_FILE = os.path.join(VERSIONS_DIR, "ACTIVE")
 RESTART_MARKER = os.path.join(VERSIONS_DIR, "RESTART.marker")
+RESTART_GO = os.path.join(VERSIONS_DIR, "RESTART.go")   # 2026-10-20: path unit 触发
 
 _SKIP_DIRS = {"__pycache__", "data", "run", "versions", ".trash", ".git"}
 
@@ -147,10 +148,27 @@ def listing():
                                 "file_count,total_bytes FROM versions"
                                 " WHERE trashed=0 ORDER BY vid")
     act = active_version()
-    return [{"vid": r["vid"], "label": r["label"], "note": r["note"],
-             "created_by": r["created_by"], "created_at": r["created_at"],
-             "file_count": r["file_count"], "total_bytes": r["total_bytes"],
-             "active": r["vid"] == act} for r in rows or []]
+    out = [{"vid": r["vid"], "label": r["label"], "note": r["note"],
+            "created_by": r["created_by"], "created_at": r["created_at"],
+            "file_count": r["file_count"], "total_bytes": r["total_bytes"],
+            "e6": _snapshot_is_e6(r["vid"]),
+            "active": r["vid"] == act} for r in rows or []]
+    # 2026-10-20 用户拍板: 切换前自动快照置顶(只留最新一份, 见 switch_to)
+    snaps = [x for x in out if x["label"] == "切换前自动快照"]
+    rest = [x for x in out if x["label"] != "切换前自动快照"]
+    return snaps + rest
+
+
+def _snapshot_is_e6(vid):
+    """该版本快照是否含项目分域(E6 的 /api/projects 路由). 旧版切过去后项目数据
+    暂时不可见 —— 前端据此给「旧版」标记 + 切换警告(2026-10-20 用户被吓过一次)."""
+    try:
+        fp = os.path.join(VERSIONS_DIR, vid, "files", "server.py")
+        with open(fp, encoding="utf-8", errors="replace") as f:
+            head = f.read(65536)
+        return "api/projects" in head
+    except OSError:
+        return True     # 读不到就按新版对待, 不误伤
 
 
 def diff(va, vb):
@@ -220,11 +238,30 @@ def switch_to(vid, actor):
     _set_active(vid)
     with open(RESTART_MARKER, "w", encoding="utf-8") as f:
         f.write("%s %s %s" % (time.time(), actor, vid))
+    # 2026-10-20 重启机制去 sudoers 化: 有 AT_RESTART_CMD 走老口径(自检/自装),
+    # 否则只写 RESTART.go —— systemd path unit(以 root)监到即重启服务,
+    # 不再依赖 sudoers(曾两次凭空消失, 切换重启静默失效全天).
     if RESTART_CMD:                     # 1.5s 缓冲让 HTTP 响应先走完
         subprocess.Popen(
-            "sleep 1.5; " + RESTART_CMD,
+            "sleep 1.5; " + RESTART_CMD
+            + " >> %s 2>&1" % os.path.join(VERSIONS_DIR, "restart.log"),
             shell=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.Popen(               # 真写入(不是 touch: 纯 utimensat 不产生
+            "sleep 1.5; date +%s > " + RESTART_GO,   # inotify 写事件, path unit 不响)
+            shell=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 2026-10-20 用户拍板: 切换前自动快照只留最新一份(旧的进 .trash 永不真删)
+    with webusers._lock, webusers._db() as c:
+        rows = webusers._sql(c, "SELECT vid,label FROM versions"
+                                " WHERE trashed=0")
+    for r in rows or []:
+        if r.get("label") == "切换前自动快照" and r.get("vid") != pre:
+            try:
+                delete(r["vid"])
+            except Exception:
+                pass
     webusers.audit(actor, "version_switch", "%s ← %s(预快照%s)"
                    % (vid, man.get("active_at_create") or "?", pre))
     return True, {"vid": vid, "pre_snapshot": pre,
@@ -330,7 +367,7 @@ def merge(va, vb, label, note, actor, picks=None):
 # ---------------- 定型(仅超管入口; 桌面 finalize 同口径, 纪元重开) ----------------
 def finalize(label, note, actor):
     """定型: 全部旧版本(含 .trash)整体归档进 versions/archive/<时间戳>/
-    (永不真删, 后悔药), 当前**运行中的工作区状态**建成新纪元基线 v0001.
+    (永不真删, 后悔药), 当前**运行中的工作区状态**建成新基线 v0001(舾装).
     编号跨纪元重启(archive 不参与高水位), 纪元内"删过的号不回收"照旧;
     定型后旧版本不再出现在清单、不可再切换回退 —— 这正是定型的含义.
     安全线: 归档只移不删; 挪失败不动数据库(已挪的在 archive, 无损可手工
@@ -381,6 +418,6 @@ def finalize(label, note, actor):
                        % (r, arch))
     _set_active(r["vid"])
     webusers.audit(actor, "version_finalize",
-                   "%s 新纪元基线 · 归档 %d 项 → %s"
+                   "%s 新基线(舾装) · 归档 %d 项 → %s"
                    % (r["vid"], len(moved), arch))
     return True, {"vid": r["vid"], "archive": arch, "archived": len(moved)}

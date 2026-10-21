@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS versions(          -- E2: 版本登记(快照文件�
   note TEXT DEFAULT '', created_by TEXT DEFAULT '',
   created_at REAL DEFAULT 0, file_count INTEGER DEFAULT 0,
   total_bytes INTEGER DEFAULT 0, trashed INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS projects(          -- E6: 项目(会话+忆库+账本的容器)
+  pid INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '',
+  owner TEXT DEFAULT '', created_at REAL DEFAULT 0, public INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS project_shares(    -- E6: 协作(perm: read 只读/write 可编辑)
+  pid INTEGER NOT NULL, uid TEXT NOT NULL, perm TEXT DEFAULT 'read',
+  created_at REAL DEFAULT 0, PRIMARY KEY(pid, uid));
 """
 SCHEMA_PG = """
 CREATE TABLE IF NOT EXISTS users(
@@ -58,6 +64,12 @@ CREATE TABLE IF NOT EXISTS versions(
   note TEXT DEFAULT '', created_by TEXT DEFAULT '',
   created_at REAL DEFAULT 0, file_count INTEGER DEFAULT 0,
   total_bytes INTEGER DEFAULT 0, trashed INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS projects(
+  pid BIGSERIAL PRIMARY KEY, name TEXT DEFAULT '',
+  owner TEXT DEFAULT '', created_at REAL DEFAULT 0, public INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS project_shares(
+  pid INTEGER NOT NULL, uid TEXT NOT NULL, perm TEXT DEFAULT 'read',
+  created_at REAL DEFAULT 0, PRIMARY KEY(pid, uid));
 """
 _schema_ready = False
 
@@ -89,8 +101,16 @@ def _db():
         if not _schema_ready:
             if PG_MODE:
                 conn.cursor().execute(SCHEMA_PG)      # PG 一次 execute 吃多句
+                conn.cursor().execute(                # 老库加列(2026-10-20)
+                    "ALTER TABLE projects ADD COLUMN IF NOT EXISTS"
+                    " public INTEGER DEFAULT 0")
             else:
                 conn.executescript(SCHEMA_SQLITE)     # sqlite 要 executescript
+                try:                                  # sqlite 无 IF NOT EXISTS,
+                    conn.execute("ALTER TABLE projects ADD COLUMN"
+                                 " public INTEGER DEFAULT 0")
+                except Exception:
+                    pass
             _schema_ready = True
         yield conn
         conn.commit()
@@ -277,3 +297,113 @@ def list_audit(limit=100) -> list:
         return _sql(c, "SELECT ts,actor,action,detail FROM audit"
                     " ORDER BY id DESC LIMIT ?",
                     (max(1, min(int(limit or 100), 1000)),))
+
+
+# ---------------- E6 项目与分享(2026-10-20) ----------------
+def create_project(name, owner, public=False):
+    """建项目 → dict 行(pid,name,owner,created_at,public). 失败 None.
+    public=True = 公共项目(所有人都能看到, 非项目主只读)."""
+    with _lock, _db() as c:
+        _sql(c, "INSERT INTO projects(name,owner,created_at,public)"
+                " VALUES(?,?,?,?)",
+             (str(name or "")[:80], str(owner or ""), time.time(),
+              1 if public else 0))
+        rows = _sql(c, "SELECT pid,name,owner,created_at,public FROM projects"
+                       " WHERE owner=? ORDER BY pid DESC LIMIT 1",
+                    (str(owner or ""),))
+    return rows[0] if rows else None
+
+
+def set_project_public(pid, on):
+    """公共项目开关(owner 用)."""
+    with _lock, _db() as c:
+        _exec(c, "UPDATE projects SET public=? WHERE pid=?",
+              (1 if on else 0, int(pid)))
+
+
+def list_public_projects(uid):
+    """公共项目(所有人可见; 不含自己的 —— 自己的在 list_own_projects 里)."""
+    with _lock, _db() as c:
+        return _sql(c, "SELECT p.pid,p.name,p.owner,p.created_at,p.public,"
+                       "u.username AS owner_name FROM projects p"
+                       " LEFT JOIN users u ON u.uid=p.owner"
+                       " WHERE p.public=1 AND p.owner!=? ORDER BY p.pid",
+                    (str(uid or ""),))
+
+
+def get_project(pid):
+    with _lock, _db() as c:
+        rows = _sql(c, "SELECT pid,name,owner,created_at,public FROM projects"
+                       " WHERE pid=?", (int(pid),))
+    return rows[0] if rows else None
+
+
+def rename_project(pid, name):
+    with _lock, _db() as c:
+        _exec(c, "UPDATE projects SET name=? WHERE pid=?", (str(name)[:80], int(pid)))
+    return True
+
+
+def list_own_projects(uid):
+    with _lock, _db() as c:
+        return _sql(c, "SELECT pid,name,owner,created_at,public FROM projects"
+                       " WHERE owner=? ORDER BY pid", (str(uid or ""),))
+
+
+def list_shared_projects(uid):
+    """被分享给我的项目(带 owner 名与我的权限)."""
+    with _lock, _db() as c:
+        return _sql(c, "SELECT p.pid,p.name,p.owner,p.created_at,s.perm,"
+                       "u.username AS owner_name FROM project_shares s"
+                       " JOIN projects p ON p.pid=s.pid"
+                       " LEFT JOIN users u ON u.uid=p.owner"
+                       " WHERE s.uid=? ORDER BY p.pid", (str(uid or ""),))
+
+
+def shares_of(pid):
+    """这个项目分享给了谁(带用户名)."""
+    with _lock, _db() as c:
+        return _sql(c, "SELECT s.uid,s.perm,s.created_at,u.username"
+                       " FROM project_shares s LEFT JOIN users u ON u.uid=s.uid"
+                       " WHERE s.pid=? ORDER BY s.created_at", (int(pid),))
+
+
+def upsert_share(pid, uid, perm):
+    """分享/改权限(perm: read|write). UPDATE 优先, 无行再 INSERT(撞主键不炸)."""
+    with _lock, _db() as c:
+        n = _exec(c, "UPDATE project_shares SET perm=? WHERE pid=? AND uid=?",
+                  (str(perm), int(pid), str(uid)))
+        if not n:
+            _sql(c, "INSERT INTO project_shares(pid,uid,perm,created_at)"
+                    " VALUES(?,?,?,?)",
+                 (int(pid), str(uid), str(perm), time.time()))
+
+
+def remove_share(pid, uid):
+    with _lock, _db() as c:
+        _exec(c, "DELETE FROM project_shares WHERE pid=? AND uid=?",
+              (int(pid), str(uid)))
+
+
+def project_access(pid, uid):
+    """该用户对项目的权限: "owner" | "write" | "read" | ""(不可见).
+    公共项目(public=1): 登录者全员可见(非项目主只读)."""
+    p = get_project(pid)
+    if p is None:
+        return ""
+    if p["owner"] == str(uid or ""):
+        return "owner"
+    if p.get("public"):
+        return "read"
+    with _lock, _db() as c:
+        rows = _sql(c, "SELECT perm FROM project_shares"
+                       " WHERE pid=? AND uid=?", (int(pid), str(uid or "")))
+    return (rows[0].get("perm") or "read") if rows else ""
+
+
+def default_project(uid):
+    """用户默认个人项目(没有就建「我的项目」)."""
+    rows = list_own_projects(uid)
+    if rows:
+        return rows[0]
+    return create_project("我的项目", uid)

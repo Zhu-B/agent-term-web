@@ -20,6 +20,11 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(BASE, "run", "sessions")
 
 
+def sessions_dir() -> str:
+    """会话档目录(E6: 服务器按线程上下文把这里替换成项目目录)."""
+    return SESSIONS_DIR
+
+
 def _sid_new() -> str:
     return "s" + time.strftime("%Y%m%d_%H%M%S") + "_" + os.urandom(2).hex()
 
@@ -90,7 +95,7 @@ class Session:
     @classmethod
     def new(cls, cwd="") -> "Session":
         sid = _sid_new()
-        s = cls(sid, os.path.join(SESSIONS_DIR, sid + ".jsonl"))
+        s = cls(sid, os.path.join(sessions_dir(), sid + ".jsonl"))
         s.meta(event="session_start", cwd=cwd)
         return s
 
@@ -106,9 +111,10 @@ class Session:
     def latest(cls):
         """最近一个会话文件(按文件名排序=按 sid 时间), 没有则 None."""
         try:
-            files = sorted(f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl"))
+            files = sorted(f for f in os.listdir(sessions_dir())
+                           if f.endswith(".jsonl"))
         except OSError:
             return None
         if not files:
             return None
-        return os.path.join(SESSIONS_DIR, files[-1])
+        return os.path.join(sessions_dir(), files[-1])

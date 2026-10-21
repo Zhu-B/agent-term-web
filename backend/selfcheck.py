@@ -328,16 +328,21 @@ def main():
         chk("token 鉴权(裸=401/带=200)", c1 == 401 and c2 == 200,
             "%s/%s" % (c1, c2))
 
-        # ⑨ M2 忆库: 造真卡 → 清单两区 + 点开读 + 注入会话
+        # ⑨ M2 忆库: 造真卡 → 清单两区 + 点开读 + 注入会话(E6: 都走默认项目)
         import memory as memory_mod
+        _, pr = api("/api/projects")
+        pid9 = pr["projects"][0]["pid"]
+        server.set_project(pid9)
         memory_mod.write_card("自检卡", "跨会话记忆自检内容 XYZ",
                               zone="archive")
-        code, r = api("/api/memory")
+        code, r = api("/api/memory?pid=%s" % pid9)
         ok_mem = code == 200 and any(
             c["title"] == "自检卡" and c["zone"] == "archive"
             for c in r.get("cards", []))
-        _, r = api("/api/memory/card?title=" + urllib.parse.quote("自检卡"))
+        _, r = api("/api/memory/card?pid=%s&title=%s"
+                   % (pid9, urllib.parse.quote("自检卡")))
         ok_mem = ok_mem and r.get("ok") and "XYZ" in (r.get("content") or "")
+        server.set_project(None)
         chk("忆库API(两区清单+点开读)", ok_mem, str(r)[:120])
         c2, r2 = api("/api/sessions/%s/memory" % sid, {"title": "自检卡"})
         chk("记忆卡注入会话", c2 == 200 and r2.get("ok"), str(r2)[:80])
@@ -350,8 +355,9 @@ def main():
         ok_sk = ok_sk and r.get("ok") and len(r.get("body") or "") > 100
         chk("技能API(清单+读全文)", ok_sk, str(r)[:100])
 
-        # ⑪ M2 账本: 造真账 → 明细 + 聚总
+        # ⑪ M2 账本: 造真账 → 明细 + 聚总(E6: 账本按项目)
         import ledger as ledger_mod
+        server.set_project(pid9)
         ledger_mod.append({"ts": time.time(), "sid": "chk", "parent": "p",
                            "sub": "web检查", "model": "fake/fake-model",
                            "task": "自检任务", "ok": True,
@@ -359,13 +365,14 @@ def main():
                                       "completion_tokens": 1,
                                       "total_tokens": 2},
                            "wall_s": 0.1, "result_head": "自检结果"})
-        code, r = api("/api/ledger?limit=50")
+        server.set_project(None)
+        code, r = api("/api/ledger?limit=50&pid=%s" % pid9)
         ok_lg = (code == 200
                  and any(e.get("sub") == "web检查"
                          for e in r.get("entries", []))
                  and any(g.get("model") == "fake/fake-model"
                          for g in r.get("aggregate", [])))
-        chk("账本API(明细+聚总)", ok_lg, "")
+        chk("账本API(明细+聚总)", ok_lg, str(r)[:200])
 
         # ⑫ E1 多用户: 影子超管令牌 → 开户 → 登录 → 越权拦截
         server.TOKEN = "t123"
@@ -392,23 +399,37 @@ def main():
             ok_admin and ok_create and ok_login and ok_badpw and ok_me
             and ok_403 and ok_notoken, str(r)[:120])
 
-        # ⑬ E1 会话归属: bob 只见自己的, 摸别人的 403
+        # ⑬ E1 会话归属: bob 只见自己的, 摸别人的 403(E6: 超管也只见自己的)
         c, r = api("/api/sessions", {"model": "fake/fake-model"}, token=bob_tok)
         bob_sid = r.get("sid")
+        c, r = api("/api/sessions", {"model": "fake/fake-model"}, token="t123")
+        t_sid = r.get("sid")                      # t123 自己的会话(E5 用)
+        reset_script(t_sid, [{"content": "READMEREPLY"}])   # 给真回合(E5 回放用)
+        global _SSE_TOKEN
+        _SSE_TOKEN = "t123"
+        sse_t = SSE(t_sid)
+        api("/api/sessions/%s/send" % t_sid, {"text": "你好"}, token="t123")
+        fin_t = sse_t.wait(lambda ev: ev and ev.get("type") == "turn_end")
+        sse_t.close()
         _, r = api("/api/sessions", token=bob_tok)
-        n_bob = len(r.get("sessions", []))
+        ok_boblist = all(x["sid"] != t_sid for x in r.get("sessions", []))
         _, r = api("/api/sessions", token="t123")
-        n_admin = len(r.get("sessions", []))
-        c, _ = api("/api/sessions/%s/send" % sid, {"text": "偷看"},
+        ok_admlist = all(x["sid"] != bob_sid for x in r.get("sessions", []))
+        c, _ = api("/api/sessions/%s/send" % t_sid, {"text": "偷看"},
                    token=bob_tok)
-        ok_own = bool(bob_sid) and n_bob >= 1 and n_admin > n_bob and c == 403
-        chk("E1 会话归属(自己可见/别人403/超管全见)", ok_own,
-            "bob=%d admin=%d rc=%s" % (n_bob, n_admin, c))
+        ok_own = (bool(bob_sid) and bool(t_sid) and ok_boblist and ok_admlist
+                  and c == 403)
+        chk("E1 会话归属(自己可见/别人403/超管只见自己的项目)", ok_own,
+            "bob=%s t=%s bl=%s al=%s rc=%s"
+            % (bob_sid, t_sid, ok_boblist, ok_admlist, c))
 
         # ⑭ E1 数据分域: bob 的记忆卡/私有档, bob 可见而超管(全局)不见
-        server.set_user(bob_uid)
+        #    (E6: 卡写进 bob 自己的默认项目)
+        _, rb = api("/api/projects", token=bob_tok)
+        bob_pid = rb["projects"][0]["pid"]
+        server.set_project(bob_pid)
         memory_mod.write_card("bob的卡", "BOB-SECRET", zone="archive")
-        server.set_user(None)
+        server.set_project(None)
         _, r = api("/api/memory", token=bob_tok)
         ok_mem = any(cc["title"] == "bob的卡" for cc in r.get("cards", []))
         _, r = api("/api/memory", token="t123")
@@ -579,6 +600,44 @@ def main():
             ok_m403 and ok_mv and b_intact and ok_maudit,
             "mv=%s %s" % (mv, str(r)[:100]))
 
+        # ㉛ 切换前自动快照治理(2026-10-20 用户拍板): 只留最新一份 + 清单置顶
+        #     (第二次切换触发 GC: 旧快照 v0003 进 .trash 永不真删)
+        c, r = api("/api/versions/switch", {"vid": "v0004"}, token="t123")
+        snap_new = r.get("pre_snapshot")
+        ok_snap = c == 200 and bool(snap_new)
+        f_list2 = version_mod.listing()
+        snaps2 = [x for x in f_list2 if x["label"] == "切换前自动快照"]
+        ok_snapone = len(snaps2) == 1 and snaps2[0]["vid"] == snap_new
+        ok_snaptop = f_list2[0]["vid"] == snap_new
+        ok_snapold = (all(x["vid"] != "v0003" for x in f_list2)
+                      and os.path.isdir(os.path.join(
+                          version_mod.VERSIONS_DIR, ".trash", "v0003")))
+        chk("切换前自动快照(只留最新/清单置顶/旧快照进trash)",
+            ok_snap and ok_snapone and ok_snaptop and ok_snapold,
+            "snap=%s one=%s top=%s old=%s" % (snap_new, ok_snapone,
+                                              ok_snaptop, ok_snapold))
+
+        # ㉛b 重启触发去 sudoers 化: 无 AT_RESTART_CMD 时写 RESTART.go
+        #     (生产用 systemd path unit 监它重启; 自检只验文件落位)
+        saved_rc = version_mod.RESTART_CMD
+        version_mod.RESTART_CMD = ""
+        ok_sw2, _ = version_mod.switch_to("v0001", "probe")
+        time.sleep(2)
+        ok_go = ok_sw2 and os.path.isfile(version_mod.RESTART_GO)
+        version_mod.RESTART_CMD = saved_rc
+        # 旧版标记: v0001 的快照 server.py 是 "A=1"(无 /api/projects)→ e6=False;
+        # 造一个含 E6 标记的版本 → e6=True 侧成真
+        _w("server.py", "x = 'api/projects'\n")
+        c, r = api("/api/versions", {"label": "E6时代"}, token="t123")
+        ok_e6t = c == 200
+        f_list3 = version_mod.listing()
+        ok_e6mark = any(x["vid"] == "v0001" and x["e6"] is False
+                        for x in f_list3) and any(
+            x["e6"] is True for x in f_list3)
+        chk("切换重启GO触发(RESTART_CMD空→写RESTART.go)+旧版标记(无E6路由→e6=False)",
+            ok_go and ok_e6t and ok_e6mark,
+            "sw=%s go=%s e6t=%s mark=%s" % (ok_sw2, ok_go, ok_e6t, ok_e6mark))
+
         # ㉕ E4.1 定型: 用户403; 旧版本+回收站整体归档(含 index.json 后悔药);
         #    当前工作区建成新纪元基线 v0001(编号跨纪元重启, 纪元内不回收照旧);
         #    单基线拒定型; 新基线是工作区快照(含 v0001 旧版没有的 extra.py)
@@ -591,10 +650,10 @@ def main():
         vroot = version_mod.VERSIONS_DIR
         ok_farch = (os.path.isdir(farch)
                     and os.path.isdir(os.path.join(farch, "v0001"))
-                    and os.path.isdir(os.path.join(farch, "v0003"))
                     and os.path.isdir(os.path.join(farch, "v0004"))
                     and os.path.isdir(os.path.join(farch, mv or "?"))
                     and os.path.isdir(os.path.join(farch, "trash", "v0002"))
+                    and os.path.isdir(os.path.join(farch, "trash", "v0003"))
                     and os.path.isfile(os.path.join(farch, "index.json")))
         ok_fgone = (not os.path.isdir(os.path.join(vroot, "v0003"))
                     and not os.path.isdir(os.path.join(vroot, ".trash")))
@@ -779,62 +838,190 @@ def main():
             "m200=%s m401=%s m404=%s trav=%s"
             % (ok_m200, ok_m401, ok_m404, ok_mtrav))
 
-        # ㉙ 忆库操作(2026-10-20): 遗忘/恢复两区挪动 + 真删
+        # ㉙ 忆库操作(2026-10-20): 遗忘/恢复两区挪动 + 真删(E6: 走 t123 默认项目)
+        _, rp = api("/api/projects", token="t123")
+        t_pid = rp["projects"][0]["pid"]
+        server.set_project(t_pid)
         memory_mod.write_card("待删卡", "内容")
-        c, r = api("/api/memory/zone", {"title": "待删卡", "to": "forget"},
-                   token="t123")
+        server.set_project(None)
+        c, r = api("/api/memory/zone", {"pid": t_pid, "title": "待删卡",
+                                        "to": "forget"}, token="t123")
         ok_zf = c == 200
-        _, r = api("/api/memory", token="t123")
+        _, r = api("/api/memory?pid=%s" % t_pid, token="t123")
         ok_zlist = any(x["title"] == "待删卡" and x["zone"] == "forget"
                        for x in r.get("cards", []))
-        c, _ = api("/api/memory/zone", {"title": "待删卡", "to": "archive"},
-                   token="t123")
+        c, _ = api("/api/memory/zone", {"pid": t_pid, "title": "待删卡",
+                                        "to": "archive"}, token="t123")
         ok_zb = c == 200
-        c, _ = api("/api/memory/card", {"title": "待删卡"}, method="DELETE",
-                   token="t123")
+        c, _ = api("/api/memory/card", {"pid": t_pid, "title": "待删卡"},
+                   method="DELETE", token="t123")
         ok_del = c == 200
-        _, r = api("/api/memory", token="t123")
+        _, r = api("/api/memory?pid=%s" % t_pid, token="t123")
         ok_gone = all(x["title"] != "待删卡" for x in r.get("cards", []))
-        c, _ = api("/api/memory/card", {"title": "待删卡"}, method="DELETE",
-                   token="t123")
+        c, _ = api("/api/memory/card", {"pid": t_pid, "title": "待删卡"},
+                   method="DELETE", token="t123")
         ok_d404 = c == 404
         chk("忆库操作(遗忘入区/恢复回区/真删消失/再删404)",
             ok_zf and ok_zlist and ok_zb and ok_del and ok_gone and ok_d404,
             "zf=%s zlist=%s zb=%s del=%s gone=%s 404=%s"
             % (ok_zf, ok_zlist, ok_zb, ok_del, ok_gone, ok_d404))
 
+        # ㉚ E6 项目与分享(2026-10-20): 建/分享(读→写)/标记/admin 无透视/
+        #    项目隔离(同名卡不同内容)/取消分享/迁移冒烟
+        c, r = api("/api/projects", {"name": "共享测试"}, token="t123")
+        p2 = r.get("project") or {}
+        p2pid = p2.get("pid")
+        ok_p2 = c == 200 and bool(p2pid)
+        _, r = api("/api/projects", token=bob_tok)
+        ok_p2hide = all(x["pid"] != p2pid for x in r.get("projects", []))
+        c, _ = api("/api/projects/share", {"pid": p2pid, "username": "bob",
+                                           "perm": "read"}, token="t123")
+        ok_share = c == 200
+        _, r = api("/api/projects", token=bob_tok)
+        p2b = next((x for x in r.get("projects", []) if x["pid"] == p2pid), None)
+        ok_shared = p2b is not None and p2b["kind"] == "shared" \
+            and p2b["perm"] == "read" and bool(p2b.get("owner_name"))
+        c, _ = api("/api/sessions", {"model": "fake/fake-model",
+                                     "pid": p2pid}, token=bob_tok)
+        ok_ro403 = c == 404                      # 只读共享: 建会话被拒
+        c, _ = api("/api/projects/share", {"pid": p2pid, "username": "bob",
+                                           "perm": "write"}, token="t123")
+        ok_upgrade = c == 200
+        saved_lp2 = provider_mod.load_providers     # fake 家供建会话(㉗ 复原过真链)
+        provider_mod.load_providers = lambda: dict(
+            {"fake": fake}, **old_customs())
+        c, r = api("/api/sessions", {"model": "fake/fake-model",
+                                     "pid": p2pid}, token=bob_tok)
+        ok_bobw = c == 200 and bool(r.get("sid"))   # 可编辑: 建会话放行
+        provider_mod.load_providers = saved_lp2
+        _, r = api("/api/projects", token="t123")
+        p2t = next((x for x in r.get("projects", []) if x["pid"] == p2pid), None)
+        ok_marks = p2t is not None and p2t["kind"] == "own" \
+            and any(s["username"] == "bob" and s["perm"] == "write"
+                    for s in p2t.get("shares", []))   # 共享项目标记: 和谁分享
+        c, _ = api("/api/sessions?pid=%s" % bob_pid, token="t123")
+        ok_adm404 = c == 404                      # admin 无透视: 摸 bob 项目 404
+        server.set_project(p2pid)
+        memory_mod.write_card("隔离卡", "P2-内容", zone="archive")
+        server.set_project(bob_pid)
+        memory_mod.write_card("隔离卡", "BOB-内容", zone="archive")
+        server.set_project(None)
+        _, r = api("/api/memory/card?pid=%s&title=%s"
+                   % (p2pid, urllib.parse.quote("隔离卡")), token=bob_tok)
+        ok_iso = r.get("ok") and "P2-内容" in (r.get("content") or "")
+        _, r = api("/api/memory/card?pid=%s&title=%s"
+                   % (bob_pid, urllib.parse.quote("隔离卡")), token=bob_tok)
+        ok_iso = ok_iso and r.get("ok") and "BOB-内容" in (r.get("content") or "")
+        c, _ = api("/api/projects/share", {"pid": p2pid, "username": "bob"},
+                   method="DELETE", token="t123")
+        ok_unshare = c == 200
+        c, _ = api("/api/sessions?pid=%s" % p2pid, token=bob_tok)
+        ok_gone = c == 404
+        # 迁移冒烟: 旧全局目录假档(bob 属主; 影子超管不在 users 表, 迁移不处理它)
+        osd = server._orig_sessions_dir()
+        os.makedirs(osd, exist_ok=True)
+        fake_old = os.path.join(osd, "s99999999_000000_0000.jsonl")
+        with open(fake_old, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": "meta",
+                                "obj": {"uid": bob_uid}}, ensure_ascii=False)
+                    + "\n" + json.dumps({"kind": "message", "obj": {
+                        "role": "user", "content": "老档"}},
+                        ensure_ascii=False) + "\n")
+        server.migrate_projects()
+        moved_to = os.path.join(server.PROJECTS_DIR, str(bob_pid), "sessions",
+                                "s99999999_000000_0000.jsonl")
+        ok_mig = os.path.isfile(moved_to) and not os.path.isfile(fake_old)
+        server.migrate_projects()                  # 幂等: 有标记不再动
+        ok_mig = ok_mig and os.path.isfile(moved_to)
+        # E6b 公共项目: 建公共 → 全员可见(只读); 非项目主写 404; 关公共即消失
+        c, r = api("/api/projects", {"name": "公共公告", "public": True},
+                   token="t123")
+        pubpid = (r.get("project") or {}).get("pid")
+        ok_pubc = c == 200 and bool(pubpid)
+        _, r = api("/api/projects", token=bob_tok)
+        pubb = next((x for x in r.get("projects", [])
+                     if x["pid"] == pubpid), None)
+        ok_pubsee = pubb is not None and pubb["kind"] == "public" \
+            and pubb["perm"] == "read"
+        saved_lp3 = provider_mod.load_providers
+        provider_mod.load_providers = lambda: dict(
+            {"fake": fake}, **old_customs())
+        c, _ = api("/api/sessions", {"model": "fake/fake-model",
+                                     "pid": pubpid}, token=bob_tok)
+        ok_pubro = c == 404                      # 公共但非项目主: 只读
+        provider_mod.load_providers = saved_lp3
+        c, _ = api("/api/projects/public", {"pid": pubpid, "public": False},
+                   token="t123")
+        ok_puboff = c == 200
+        _, r = api("/api/projects", token=bob_tok)
+        ok_pubgone = all(x["pid"] != pubpid for x in r.get("projects", []))
+        chk("E6 项目(建/分享read拒写/升write放行/标记含谁/admin无透视404/"
+            "同名卡项目隔离/取消分享404/迁移冒烟幂等)",
+            ok_p2 and ok_p2hide and ok_share and ok_shared and ok_ro403
+            and ok_upgrade and ok_bobw and ok_marks and ok_adm404 and ok_iso
+            and ok_unshare and ok_gone and ok_mig,
+            "p2=%s hide=%s sh=%s ro=%s w=%s marks=%s adm=%s iso=%s mig=%s"
+            % (ok_p2, ok_p2hide, ok_shared, ok_ro403, ok_bobw, ok_marks,
+               ok_adm404, ok_iso, ok_mig))
+        _, r = api("/api/projects", token="t123")
+        pubo = next((x for x in r.get("projects", [])
+                     if x["pid"] == pubpid), None)
+        ok_pubown = pubo is not None and pubo.get("public") is False  # 关后自己视角也非公共
+        # E6c 协作选人名册: 任何登录者可拉(只回名字/角色, 无令牌/uid)
+        c, r = api("/api/users", token=bob_tok)
+        ok_roster = c == 200 and any(
+            u.get("username") == "bob" for u in r.get("users", [])) \
+            and all("token" not in u and "uid" not in u
+                    for u in r.get("users", []))
+        c, _ = api("/api/users")
+        ok_roster401 = c == 401
+        chk("E6c 协作选人名册(登录者可拉/不含token与uid/裸访401)",
+            ok_roster and ok_roster401,
+            "roster=%s 401=%s" % (ok_roster, ok_roster401))
+        chk("E6b 公共项目(建公共/全员可见只读/非主写404/关公共即消失/自己视角标记)",
+            ok_pubc and ok_pubsee and ok_pubro and ok_puboff and ok_pubgone
+            and ok_pubown,
+            "c=%s see=%s ro=%s off=%s gone=%s own=%s"
+            % (ok_pubc, ok_pubsee, ok_pubro, ok_puboff, ok_pubgone, ok_pubown))
+
         # ㉒ E5 持久会话: drop 模拟重启 → 归档可见+磁盘回放+越权 403×2
         #     + resume 同 sid 续聊(transcript 继续增长)
-        #     (E5.1 起 DELETE=真删, 模拟重启改走 HUB.drop 不 purge)
-        sid_file = os.path.join(session_mod.SESSIONS_DIR, sid + ".jsonl")
+        #     (E5.1 起 DELETE=真删, 模拟重启改走 HUB.drop 不 purge;
+        #      E6 起会话档在 t123 的项目目录里)
+        server.set_project(t_pid)
+        sid_file = os.path.join(session_mod.sessions_dir(), t_sid + ".jsonl")
+        server.set_project(None)
         ok_file = os.path.isfile(sid_file)
-        server.HUB.drop(sid)
+        server.HUB.drop(t_sid)
         time.sleep(0.5)
         _, r = api("/api/sessions", token="t123")
         arch = next((x for x in r.get("sessions", [])
-                     if x["sid"] == sid), None)
+                     if x["sid"] == t_sid), None)
         ok_arch = arch is not None and arch.get("archived")
-        _, r = api("/api/sessions/%s/messages" % sid, token="t123")
+        _, r = api("/api/sessions/%s/messages?pid=%s" % (t_sid, t_pid),
+                   token="t123")
         ok_play = any("README" in (m.get("content") or "")
                       for m in r.get("messages", []))
-        c, _ = api("/api/sessions/%s/messages" % sid, token=bob_tok)
-        ok_403a = c == 403                # 老档无归属 → 仅超管可见
+        c, _ = api("/api/sessions/%s/messages?pid=%s" % (t_sid, t_pid),
+                   token=bob_tok)
+        ok_403a = c == 404                # 非项目成员: 404(不泄露项目存在)
         c, _ = api("/api/sessions", {"model": "fake/fake-model",
-                                     "resume": sid}, token=bob_tok)
-        ok_403r = c == 403
+                                     "resume": t_sid, "pid": t_pid},
+                   token=bob_tok)
+        ok_403r = c == 404
         provider_mod.load_providers = lambda: dict(   # ⑯ 撤过假链, 这里挂回
             {"fake": fake}, **old_customs())
         c, r = api("/api/sessions", {"model": "fake/fake-model",
-                                     "resume": sid}, token="t123")
+                                     "resume": t_sid, "pid": t_pid},
+                   token="t123")
         r_resume_err = r
-        ok_resume = c == 200 and r.get("sid") == sid and r.get("resumed")
+        ok_resume = c == 200 and r.get("sid") == t_sid and r.get("resumed")
         sse2 = None
         if ok_resume:
-            reset_script(sid, [{"content": "收到, 接着说."}])
-            global _SSE_TOKEN
+            reset_script(t_sid, [{"content": "收到, 接着说."}])
             _SSE_TOKEN = "t123"
-            sse2 = SSE(sid)
-            api("/api/sessions/%s/send" % sid, {"text": "再补一句"},
+            sse2 = SSE(t_sid)
+            api("/api/sessions/%s/send" % t_sid, {"text": "再补一句"},
                 token="t123")
             fin = sse2.wait(lambda ev: ev and ev.get("type") == "turn_end")
             ok_resume = ok_resume and bool(fin)
@@ -850,23 +1037,27 @@ def main():
                ok_resume, grew, str(r_resume_err)[:120]))
 
         # ㉓ E5.1 删除: 归档真删(越权403/文件消失/清单消失/未知404)+活删防复活
-        server.HUB.drop(sid)                    # 活会话先归位成归档(不 purge)
+        server.HUB.drop(t_sid)                    # 活会话先归位成归档(不 purge)
         time.sleep(0.5)
-        c, _ = api("/api/sessions/%s" % sid, {}, method="DELETE", token=bob_tok)
-        ok_d403 = c == 403
-        trace_file = os.path.join(instr_mod.TRACE_DIR, sid + ".jsonl")
-        c, r = api("/api/sessions/%s" % sid, {}, method="DELETE", token="t123")
+        c, _ = api("/api/sessions/%s" % t_sid, {"pid": t_pid}, method="DELETE",
+                   token=bob_tok)
+        ok_d403 = c == 404
+        trace_file = os.path.join(instr_mod.TRACE_DIR, t_sid + ".jsonl")
+        c, r = api("/api/sessions/%s" % t_sid, {"pid": t_pid}, method="DELETE",
+                   token="t123")
         ok_del = c == 200 and r.get("ok")
         ok_gone = not (os.path.isfile(sid_file)
                        or os.path.isfile(trace_file))
         _, r = api("/api/sessions", token="t123")
-        ok_nolist = all(x["sid"] != sid for x in r.get("sessions", []))
+        ok_nolist = all(x["sid"] != t_sid for x in r.get("sessions", []))
         c, _ = api("/api/sessions/s0bad0bad_0bad0", {}, method="DELETE",
                    token="t123")
         ok_d404 = c == 404
         c, r = api("/api/sessions", {"model": "fake/fake-model"}, token="t123")
         sid2 = r.get("sid")
-        f2 = os.path.join(session_mod.SESSIONS_DIR, sid2 + ".jsonl")
+        server.set_project(t_pid)
+        f2 = os.path.join(session_mod.sessions_dir(), sid2 + ".jsonl")
+        server.set_project(None)
         ok_f2 = bool(sid2) and os.path.isfile(f2)
         fin3 = None
         if ok_f2:
@@ -880,11 +1071,12 @@ def main():
         time.sleep(0.5)
         ok_livegone = ok_f2 and bool(fin3) and c == 200 \
             and not os.path.isfile(f2) and server.HUB.get(sid2) is None
-        chk("E5.1 删除(归档越权403/真删文件+清单消失/未知404/活删防复活)",
+        chk("E5.1 删除(归档越权404/真删文件+清单消失/未知404/活删防复活)",
             ok_d403 and ok_del and ok_gone and ok_nolist and ok_d404
             and ok_livegone,
-            "403=%s del=%s gone=%s nolist=%s 404=%s live=%s"
-            % (ok_d403, ok_del, ok_gone, ok_nolist, ok_d404, ok_livegone))
+            "d404=%s del=%s gone=%s nolist=%s 404=%s live=%s f2=%s fin=%s rc=%s"
+            % (ok_d403, ok_del, ok_gone, ok_nolist, ok_d404, ok_livegone,
+               ok_f2, bool(fin3), c))
         provider_mod.PROVIDERS_CHAIN = old_chain
         provider_mod.KEY_STORE = old_keystore
         provider_mod.fetch_models = old_fetch

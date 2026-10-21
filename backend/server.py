@@ -31,6 +31,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -90,7 +91,8 @@ provider_mod.KEY_STORE = os.path.join(DATA_DIR, "keys.json")      # 无 env 口�
 provider_mod.MODELS_STORE = os.path.join(DATA_DIR, "models.json") # 模块常量, 导入后
 provider_mod.SETTINGS_STORE = os.path.join(DATA_DIR, "settings.json")  # 改属性
 webusers.DB_PATH = os.path.join(DATA_DIR, "webusers.db")
-_CTX = threading.local()          # 当前线程归属的用户(uid None = 超管/公共视角)
+_CTX = threading.local()          # 当前线程归属的用户+项目(uid None = 超管/公共视角)
+PROJECTS_DIR = os.path.join(DATA_DIR, "projects")   # E6: 项目数据根
 
 
 def set_user(uid):
@@ -101,12 +103,23 @@ def cur_uid():
     return getattr(_CTX, "uid", None)
 
 
-# 分域手法 = 替换 core 的路径解析函数(按线程查 uid)。不能翻模块常量:
+def set_project(pid):
+    _CTX.pid = pid
+
+
+def cur_pid():
+    return getattr(_CTX, "pid", None)
+
+
+# 分域手法 = 替换 core 的路径解析函数(按线程查 uid/pid)。不能翻模块常量:
 # 多用户并发线程下翻常量会串用户(甲的请求把乙的目录指过来)。
 _orig_zone_dir = memory_mod._zone_dir
 
 
 def _zone_dir(zone="archive"):
+    pid = cur_pid()
+    if pid is not None:             # E6: 忆库按项目(会话+忆库+账本都是项目数据)
+        return os.path.join(PROJECTS_DIR, str(pid), "memory", zone)
     uid = cur_uid()
     if uid is None:
         return _orig_zone_dir(zone)
@@ -119,6 +132,9 @@ _orig_ledger_path = ledger_mod._path
 
 
 def _ledger_path():
+    pid = cur_pid()                 # E6: 账本按项目
+    if pid is not None:
+        return os.path.join(PROJECTS_DIR, str(pid), "ledger", "ledger.jsonl")
     uid = cur_uid()
     if uid is None:
         return _orig_ledger_path()
@@ -126,6 +142,19 @@ def _ledger_path():
 
 
 ledger_mod._path = _ledger_path
+
+# E6: 会话档按项目(session.py 内部与 server 自身都改走这个补丁函数)
+_orig_sessions_dir = session_mod.sessions_dir
+
+
+def _sessions_dir():
+    pid = cur_pid()
+    if pid is not None:
+        return os.path.join(PROJECTS_DIR, str(pid), "sessions")
+    return _orig_sessions_dir()
+
+
+session_mod.sessions_dir = _sessions_dir
 
 _orig_layer_dir = skills_mod._layer_dir
 
@@ -461,9 +490,10 @@ class Sess:
     """一个 Web 会话 = 一个 AgentApp + 投影事件缓冲 + SSE 队列 + 挂起的问卡.
     E1: uid = 归属用户(超管/开放模式为 None), 会话列表按归属过滤."""
 
-    def __init__(self, app, uid=None):
+    def __init__(self, app, uid=None, pid=None):
         self.app = app
         self.uid = uid
+        self.pid = pid                    # E6: 项目归属
         self.sid = app.session.sid
         self.label = "%s/%s" % (app.provider.name, app.provider.model)
         self.lock = threading.Lock()
@@ -475,6 +505,8 @@ class Sess:
         self.last_touch = time.time()
         if uid is not None:               # E5: 归档归属(重启后仍能按人过滤)
             app.session.meta(uid=uid)
+        if pid is not None:               # E6: 归档后按项目过滤
+            app.session.meta(pid=pid)
         app.subscribe(self._sink)
 
     # ---- sink: 事件 → 投影 → 缓冲 + 广播(worker 线程调, 只做入队) ----
@@ -570,26 +602,29 @@ class Sess:
 
 
 # ---- E5 持久历史: 归档 transcript 只读扫描(不占句柄, 不写入) ----
-_ARCH_CACHE = (0.0, {})
+_ARCH_CACHE = (0.0, None, {})   # (ts, pid, index) —— E6: 缓存按项目隔离
 
 
 def _archived_index():
-    """run/sessions/*.jsonl → {sid: {uid, label, msgs, mtime}}.
-    归档扫描有 3s 缓存, 侧栏 8s 轮询不致反复读盘."""
+    """当前项目的 sessions/*.jsonl → {sid: {uid, pid, label, msgs, mtime}}.
+    归档扫描有 3s 缓存, 侧栏 8s 轮询不致反复读盘(E6: 只扫当前项目目录,
+    缓存键含 pid —— 多项目下串缓存会把 A 项目的清单喂给 B)."""
     global _ARCH_CACHE
-    now, cached = _ARCH_CACHE
-    if time.time() - now < 3 and cached:
+    pid = cur_pid()
+    now, cpid, cached = _ARCH_CACHE
+    if time.time() - now < 3 and cpid == pid and cached:
         return cached
     out = {}
+    sdir = session_mod.sessions_dir()
     try:
-        files = sorted((fn for fn in os.listdir(session_mod.SESSIONS_DIR)
+        files = sorted((fn for fn in os.listdir(sdir)
                         if fn.endswith(".jsonl")), reverse=True)
     except OSError:
         files = []
     for fn in files[:100]:                # 最新 100 个, 个人规模够用
         sid = fn[:-6]
-        path = os.path.join(session_mod.SESSIONS_DIR, fn)
-        uid, first_user, n = None, "", 0
+        path = os.path.join(sdir, fn)
+        muid, mpid, first_user, n = None, None, "", 0
         try:
             with open(path, encoding="utf-8") as f:
                 for ln in f:
@@ -598,9 +633,11 @@ def _archived_index():
                     except Exception:
                         continue
                     if row.get("kind") == "meta":
-                        u = (row.get("obj") or {}).get("uid")
-                        if u:
-                            uid = u
+                        o = row.get("obj") or {}
+                        if o.get("uid"):
+                            muid = o["uid"]
+                        if o.get("pid") is not None:
+                            mpid = o["pid"]
                     elif row.get("kind") == "message":
                         o = row.get("obj") or {}
                         n += 1
@@ -609,10 +646,10 @@ def _archived_index():
                             first_user = o["content"][:40]
         except OSError:
             continue
-        out[sid] = {"uid": uid,
+        out[sid] = {"uid": muid, "pid": mpid,
                     "label": first_user or "(空会话)",
                     "msgs": n, "mtime": int(os.path.getmtime(path))}
-    _ARCH_CACHE = (time.time(), out)
+    _ARCH_CACHE = (time.time(), pid, out)
     return out
 
 
@@ -620,9 +657,13 @@ def _archived_owner(sid):
     return _archived_index().get(sid, {}).get("uid", "?")   # ? = 没这档
 
 
+def _archived_pid(sid):
+    return _archived_index().get(sid, {}).get("pid")
+
+
 def _archived_messages(sid):
     """归档会话的平铺回放(与 Sess.history 同口径)."""
-    path = os.path.join(session_mod.SESSIONS_DIR, sid + ".jsonl")
+    path = os.path.join(session_mod.sessions_dir(), sid + ".jsonl")
     if not os.path.isfile(path) or "/" in sid:
         return None
     out = []
@@ -646,7 +687,7 @@ def _purge_session_files(sid):
     if not re.match(r"^s[0-9A-Za-z_.-]+$", sid):
         return False
     n = 0
-    for d in (session_mod.SESSIONS_DIR, instr.TRACE_DIR):
+    for d in (session_mod.sessions_dir(), instr.TRACE_DIR):
         try:
             p = os.path.join(d, sid + ".jsonl")
             if os.path.isfile(p):
@@ -661,7 +702,7 @@ def _archived_delete(sid):
     """E5.1 删除归档会话: 真删磁盘档 + 立刻刷归档缓存."""
     global _ARCH_CACHE
     ok = _purge_session_files(sid)
-    _ARCH_CACHE = (0.0, {})
+    _ARCH_CACHE = (0.0, None, {})
     return ok
 
 
@@ -679,11 +720,13 @@ class Hub:
             s.last_touch = time.time()
         return s
 
-    def create(self, label, uid=None, resume=""):
+    def create(self, label, uid=None, pid=None, resume=""):
         prov = resolve_model(label)
         if prov is None:
             return None, "模型 %r 不可用 —— 去 /api/models 看清单或先加自增档" % label
-        with self.lock:
+        if pid is not None:
+            set_project(pid)               # E6: 会话文件落当前项目目录(请求线程
+        with self.lock:                    # 一次性, 不用回位)
             if len(self.sessions) >= MAX_SESSIONS:      # 逐出最闲的
                 old = min(self.sessions.values(), key=lambda s: s.last_touch)
                 self.sessions.pop(old.sid, None)
@@ -715,7 +758,7 @@ class Hub:
                     pass
             if uid is not None:
                 app.session.meta(uid=uid)
-        s = Sess(app, uid)
+        s = Sess(app, uid, pid)
         app.perms.ask_fn = s.ask_perm     # perms 实例同一只, loop 侧即时生效
         app.ask_user = s.ask_user         # 双份挂(resume/clear 重建 loop 时带上)
         app.loop.ctx.ask_user = s.ask_user
@@ -727,27 +770,31 @@ class Hub:
         with self.lock:
             s = self.sessions.pop(sid, None)
         if s is not None:
+            pid = s.pid
             def _fin():
                 s.app.shutdown()
-                if purge:              # E5.1: 真删磁盘档(收尾后删, 不竞态)
-                    _purge_session_files(sid)
+                if purge:              # E5.1: 真删磁盘档(收尾后删, 不竞态;
+                    set_project(pid)   # E6: 收尾线程自己带项目上下文)
+                    try:
+                        _purge_session_files(sid)
+                    finally:
+                        set_project(None)
             threading.Thread(target=_fin, daemon=True).start()
         return s is not None
 
-    def list(self, uid=None, admin=False):
+    def list(self, uid=None, pid=None):
+        """当前项目的会话清单(活+归档). E6: admin 无透视 —— 只看自己项目."""
         with self.lock:
             items = [{"sid": s.sid, "label": s.label, "busy": s.busy,
                       "owner": s.uid, "touch": int(s.last_touch),
                       "archived": False}
                      for s in self.sessions.values()
-                     if admin or s.uid == uid]
+                     if s.pid == pid]
         # E5 持久历史: 磁盘上的归档 transcript(进程重启后仍可见/可回放/可续)
         live = {i["sid"] for i in items}
         for sid, meta in _archived_index().items():
-            if sid in live or not (admin or meta["uid"] in (uid, None)):
+            if sid in live or meta.get("pid") != pid:
                 continue
-            if meta["uid"] is None and not admin:
-                continue                  # 无归属的老档: 只有超管看得见
             items.append({"sid": sid, "label": meta["label"], "busy": False,
                           "owner": meta["uid"], "touch": meta["mtime"],
                           "msgs": meta["msgs"], "archived": True})
@@ -767,6 +814,128 @@ def _online_users():
     with HUB.lock:
         busy = sum(1 for s in HUB.sessions.values() if s.busy)
     return {"users": names, "count": len(names), "busy_sessions": busy}
+
+
+def migrate_projects():
+    """E6 一次性迁移: 每个用户建默认个人项目, 老数据(会话/忆库/账本)挪进项目根.
+    幂等(标记文件); 失败不阻断启动(数据原地未动, 下次启动重试)."""
+    marker = os.path.join(PROJECTS_DIR, ".migrated")
+    if os.path.exists(marker):
+        return
+    try:
+        os.makedirs(PROJECTS_DIR, exist_ok=True)
+        for u in webusers.list_users():
+            uid = u.get("uid") or ""
+            if not uid:
+                continue
+            p = webusers.default_project(uid)
+            if p is None:
+                continue
+            pid = p["pid"]
+            proot = os.path.join(PROJECTS_DIR, str(pid))
+            os.makedirs(proot, exist_ok=True)
+            # 会话: 旧全局目录里 meta.uid 匹配的档 → 项目目录 + meta 补 pid
+            sdir = _orig_sessions_dir()
+            if os.path.isdir(sdir):
+                for fn in sorted(os.listdir(sdir)):
+                    if not fn.endswith(".jsonl"):
+                        continue
+                    src = os.path.join(sdir, fn)
+                    try:
+                        with open(src, encoding="utf-8") as f:
+                            muid = None
+                            for ln in f:
+                                try:
+                                    row = json.loads(ln)
+                                except Exception:
+                                    continue
+                                if row.get("kind") == "meta":
+                                    muid = (row.get("obj") or {}).get("uid")
+                                if muid:
+                                    break
+                    except OSError:
+                        continue
+                    if muid != uid:
+                        continue
+                    dst_dir = os.path.join(proot, "sessions")
+                    os.makedirs(dst_dir, exist_ok=True)
+                    dst = os.path.join(dst_dir, fn)
+                    if os.path.exists(dst):
+                        continue
+                    with open(src, encoding="utf-8") as f:
+                        lines = f.read()
+                    meta_line = json.dumps({"kind": "meta",
+                                            "obj": {"pid": pid}},
+                                           ensure_ascii=False)
+                    with open(src, "w", encoding="utf-8") as f:
+                        f.write(meta_line + "\n" + lines)
+                    shutil.move(src, dst)
+            # 忆库/账本: 整目录挪进项目根
+            for sub in ("memory", "ledger"):
+                srcp = os.path.join(USER_ROOT, uid, sub)
+                if os.path.isdir(srcp):
+                    dstp = os.path.join(proot, sub)
+                    if not os.path.exists(dstp):
+                        shutil.move(srcp, dstp)
+        # 影子超管(uid None, 不在 users 表)的遗留: 全局目录里的会话+忆库+账本
+        # → "" 属主的默认项目(开放/影子视角 = 全局视角的同款家法)
+        sdir = _orig_sessions_dir()
+        if os.path.isdir(sdir):
+            leftovers = sorted(fn for fn in os.listdir(sdir)
+                               if fn.endswith(".jsonl"))
+            if leftovers:
+                sp = webusers.default_project(None)
+                if sp is not None:
+                    spid = sp["pid"]
+                    sproot = os.path.join(PROJECTS_DIR, str(spid))
+                    for sub in ("memory", "ledger"):
+                        srcp = os.path.join(DATA_DIR, sub)
+                        if os.path.isdir(srcp):
+                            dstp = os.path.join(sproot, sub)
+                            if not os.path.exists(dstp):
+                                shutil.move(srcp, dstp)
+                    sdst = os.path.join(sproot, "sessions")
+                    os.makedirs(sdst, exist_ok=True)
+                    for fn in leftovers:
+                        src = os.path.join(sdir, fn)
+                        dst = os.path.join(sdst, fn)
+                        if os.path.exists(dst):
+                            continue
+                        with open(src, encoding="utf-8") as f:
+                            lines = f.read()
+                        meta_line = json.dumps(
+                            {"kind": "meta", "obj": {"pid": spid}},
+                            ensure_ascii=False)
+                        with open(src, "w", encoding="utf-8") as f:
+                            f.write(meta_line + "\n" + lines)
+                        shutil.move(src, dst)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        pass            # 迁移失败: 数据原地未动, 下次启动重试
+
+
+def _proj_ctx(user, raw_pid, need="read"):
+    """E6: 请求里的 pid → 权限校验(owner/write/read; admin 无特权) → set_project.
+    返回 (pid, "") 或 (None, 错误文案)."""
+    uid = user.get("uid")
+    if not raw_pid:
+        p = webusers.default_project(uid)      # 缺省 = 我的默认个人项目
+        pid = (p or {}).get("pid")
+    else:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            return None, "pid 不是整数"
+    if pid is None:
+        return None, "没有可用项目(先建一个)"
+    perm = webusers.project_access(pid, uid)
+    if not perm:
+        return None, "没有这个项目(或没被分享给你)"
+    if need == "write" and perm == "read":
+        return None, "只读共享项目 —— 不能写"
+    set_project(pid)
+    return pid, ""
 
 
 # ================================ HTTP ================================
@@ -816,8 +985,17 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _own(s, user):
-        """会话归属: 本人或超管."""
-        return user.get("role") == "admin" or s.uid == user.get("uid")
+        """会话归属(E6): 项目成员(owner/read/write 共享者)可见. admin 无特权."""
+        if s.pid is None:
+            return user.get("role") == "admin" or s.uid == user.get("uid")
+        return webusers.project_access(s.pid, user.get("uid")) != ""
+
+    @staticmethod
+    def _own_write(s, user):
+        """会话写权(E6): owner 或 write 共享者."""
+        if s.pid is None:
+            return user.get("role") == "admin" or s.uid == user.get("uid")
+        return webusers.project_access(s.pid, user.get("uid")) in ("owner", "write")
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -899,7 +1077,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"ok": False, "err": "会话不存在(可能已重启)"})
             if not self._own(s, user):
                 return self._json(403, {"ok": False, "err": "不是你的会话"})
+            set_project(s.pid)             # E6: 分域上下文进当前项目
             act = m.group(2)
+            if act in ("send", "interrupt", "memory") and \
+                    not self._own_write(s, user):
+                return self._json(403, {"ok": False,
+                                        "err": "只读共享项目 —— 不能写"})
             if act == "send":
                 return self._send(s, body)
             if act == "interrupt":
@@ -924,7 +1107,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": s.answer(m.group(2), body)})
         if u.path == "/api/sessions":
             resume = str(body.get("resume") or "").strip()
-            if resume:
+            raw_pid = str(body.get("pid") or "").strip()
+            if resume:                             # 续会话: 项目由前端带来
                 live_s = HUB.get(resume)           # 已经活着: 直接复用
                 if live_s is not None:
                     if not self._own(live_s, user):
@@ -933,17 +1117,72 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"ok": True, "sid": live_s.sid,
                                             "label": live_s.label,
                                             "resumed": True})
-                if user.get("role") != "admin":
-                    owner = _archived_owner(resume)    # 越权拦截在装配之前
-                    if owner != user.get("uid"):
-                        return self._json(403, {"ok": False,
-                                                "err": "不是你的会话"})
+                pid, err = _proj_ctx(user, raw_pid, need="write")
+                if err:
+                    return self._json(404, {"ok": False, "err": err})
+                apid = _archived_pid(resume)       # 越权拦截在装配之前
+                if apid is None or int(apid) != pid:
+                    return self._json(403, {"ok": False,
+                                            "err": "不是你的会话"})
+            else:
+                pid, err = _proj_ctx(user, raw_pid, need="write")
+                if err:
+                    return self._json(404, {"ok": False, "err": err})
             s, err = HUB.create(str(body.get("model") or ""),
-                                user.get("uid"), resume=resume)
+                                user.get("uid"), pid=pid, resume=resume)
             if s is None:
                 return self._json(400, {"ok": False, "err": err})
             return self._json(200, {"ok": True, "sid": s.sid, "label": s.label,
-                                    "resumed": bool(resume)})
+                                    "pid": pid, "resumed": bool(resume)})
+        if u.path == "/api/projects":              # E6: 建项目(个人/公共)
+            name = str(body.get("name") or "").strip()
+            if not name or len(name) > 80:
+                return self._json(400, {"ok": False, "err": "名字要 1~80 字符"})
+            p = webusers.create_project(name, user.get("uid"),
+                                        public=bool(body.get("public")))
+            if p is None:
+                return self._json(500, {"ok": False, "err": "建项目失败"})
+            os.makedirs(os.path.join(PROJECTS_DIR, str(p["pid"])),
+                        exist_ok=True)
+            webusers.audit(user.get("username"), "project_create",
+                           "%d %s%s" % (p["pid"], name,
+                                        "(公共)" if p.get("public") else ""))
+            return self._json(200, {"ok": True, "project": p})
+        if u.path == "/api/projects/public":       # E6: 公共开关(owner)
+            pid = str(body.get("pid") or "").strip()
+            if webusers.project_access(pid, user.get("uid")) != "owner":
+                return self._json(403, {"ok": False,
+                                        "err": "只有项目主能开公共"})
+            webusers.set_project_public(int(pid), bool(body.get("public")))
+            webusers.audit(user.get("username"), "project_public",
+                           "%s → %s" % (pid, "公共" if body.get("public")
+                                        else "非公共"))
+            return self._json(200, {"ok": True})
+        if u.path == "/api/projects/rename":       # E6: 改名(owner)
+            pid = str(body.get("pid") or "").strip()
+            name = str(body.get("name") or "").strip()
+            if not name:
+                return self._json(400, {"ok": False, "err": "缺名字"})
+            if webusers.project_access(pid, user.get("uid")) != "owner":
+                return self._json(403, {"ok": False, "err": "只有项目主能改名"})
+            webusers.rename_project(int(pid), name)
+            return self._json(200, {"ok": True})
+        if u.path == "/api/projects/share":        # E6: 分享/改权限(owner)
+            pid = str(body.get("pid") or "").strip()
+            uname = str(body.get("username") or "").strip()
+            perm = str(body.get("perm") or "read").strip()
+            if perm not in ("read", "write"):
+                return self._json(400, {"ok": False, "err": "perm 只认 read/write"})
+            if webusers.project_access(pid, user.get("uid")) != "owner":
+                return self._json(403, {"ok": False, "err": "只有项目主能分享"})
+            target = next((u for u in webusers.list_users()
+                           if u.get("username") == uname), None)
+            if target is None:
+                return self._json(404, {"ok": False, "err": "没有这个用户"})
+            webusers.upsert_share(int(pid), target["uid"], perm)
+            webusers.audit(user.get("username"), "project_share",
+                           "%s → %s(%s)" % (pid, uname, perm))
+            return self._json(200, {"ok": True})
         if u.path == "/api/models":
             return self._post_model(body, user)
         if u.path == "/api/models/vision":    # 2026-10-20: 「能看图」勾选
@@ -955,6 +1194,10 @@ class Handler(BaseHTTPRequestHandler):
                               dict({"ok": ok},
                                    **({"model": r} if ok else {"err": r})))
         if u.path == "/api/memory/zone":      # 2026-10-20: 遗忘/恢复(两区挪动)
+            pid, err = _proj_ctx(user, str(body.get("pid") or "").strip(),
+                                  need="write")
+            if err:
+                return self._json(404, {"ok": False, "err": err})
             title = str(body.get("title") or "").strip()
             to = str(body.get("to") or "forget").strip()
             if not title or to not in ("archive", "forget"):
@@ -1091,12 +1334,18 @@ class Handler(BaseHTTPRequestHandler):
             if s is not None and not self._own(s, user):
                 return self._json(403, {"ok": False, "err": "不是你的会话"})
             if s is None:               # E5.1: 归档会话真删(磁盘档+越权拦截)
-                owner = _archived_owner(m.group(1))
-                if owner == "?":
+                body = self._body()
+                pid, err = _proj_ctx(user, str(body.get("pid") or "").strip(),
+                                      need="write")
+                if err:                 # E6: 项目由前端带来; 写权=owner/write
+                    return self._json(404, {"ok": False, "err": err})
+                apid = _archived_pid(m.group(1))
+                if apid is None or int(apid) != pid:
                     return self._json(404, {"ok": False, "err": "会话不存在"})
-                if user.get("role") != "admin" and owner != user.get("uid"):
-                    return self._json(403, {"ok": False, "err": "不是你的会话"})
                 return self._json(200, {"ok": _archived_delete(m.group(1))})
+            if not self._own_write(s, user):
+                return self._json(403, {"ok": False, "err": "只读共享项目 —— 不能删"})
+            set_project(s.pid)
             return self._json(200, {"ok": HUB.drop(m.group(1), purge=True)})
         if u.path == "/api/models":       # E1.4: 删已加入的模型档
             body = self._body()
@@ -1118,6 +1367,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True})
         if u.path == "/api/memory/card":       # 2026-10-20: 删记忆卡(真删)
             body = self._body()
+            pid, err = _proj_ctx(user, str(body.get("pid") or "").strip(),
+                                  need="write")
+            if err:
+                return self._json(404, {"ok": False, "err": err})
             title = str(body.get("title") or "").strip()
             if not title:
                 return self._json(400, {"ok": False, "err": "缺 title"})
@@ -1125,6 +1378,20 @@ class Handler(BaseHTTPRequestHandler):
             if not z:
                 return self._json(404, {"ok": False, "err": "没有这张卡"})
             memory_mod.delete_card(title, zone=z)
+            return self._json(200, {"ok": True})
+        if u.path == "/api/projects/share":       # E6: 取消分享(owner)
+            body = self._body()
+            pid = str(body.get("pid") or "").strip()
+            uname = str(body.get("username") or "").strip()
+            if webusers.project_access(pid, user.get("uid")) != "owner":
+                return self._json(403, {"ok": False, "err": "只有项目主能取消分享"})
+            target = next((u for u in webusers.list_users()
+                           if u.get("username") == uname), None)
+            if target is None:
+                return self._json(404, {"ok": False, "err": "没有这个用户"})
+            webusers.remove_share(int(pid), target["uid"])
+            webusers.audit(user.get("username"), "project_unshare",
+                           "%s × %s" % (pid, uname))
             return self._json(200, {"ok": True})
         if u.path == "/api/versions":       # E2: 删版本(仅超管, 进 .trash)
             if user.get("role") != "admin":
@@ -1149,8 +1416,39 @@ class Handler(BaseHTTPRequestHandler):
                                     "username": user.get("username"),
                                     "role": user.get("role")})
         if path == "/api/sessions":
-            return self._json(200, {"ok": True, "sessions": HUB.list(
-                user.get("uid"), user.get("role") == "admin")})
+            pid, err = _proj_ctx(user, (q.get("pid") or [""])[0])
+            if err:
+                return self._json(404, {"ok": False, "err": err})
+            return self._json(200, {"ok": True,
+                                    "sessions": HUB.list(user.get("uid"), pid)})
+        if path == "/api/users":           # 2026-10-20: 协作选人(任何登录者;
+            return self._json(200, {"ok": True, "users": [  # 只回名字/角色, 无令牌)
+                {"username": u.get("username"), "role": u.get("role"),
+                 "disabled": bool(u.get("disabled"))}
+                for u in webusers.list_users()]})
+        if path == "/api/projects":        # E6: 我的+协作+公共(标记齐全)
+            uid = user.get("uid")
+            out = []
+            for p in webusers.list_own_projects(uid):
+                out.append({"pid": p["pid"], "name": p["name"], "kind": "own",
+                            "perm": "owner", "public": bool(p.get("public")),
+                            "owner_name": user.get("username"),
+                            "shares": [{"username": s["username"] or "?",
+                                        "perm": s["perm"]}
+                                       for s in webusers.shares_of(p["pid"])]})
+            for p in webusers.list_shared_projects(uid):
+                out.append({"pid": p["pid"], "name": p["name"], "kind": "shared",
+                            "perm": p["perm"], "public": False,
+                            "owner_name": p.get("owner_name")
+                            or (p["owner"] == "" and "超管") or "?",
+                            "shares": []})
+            for p in webusers.list_public_projects(uid):
+                out.append({"pid": p["pid"], "name": p["name"], "kind": "public",
+                            "perm": "read", "public": True,
+                            "owner_name": p.get("owner_name")
+                            or (p["owner"] == "" and "超管") or "?",
+                            "shares": []})
+            return self._json(200, {"ok": True, "projects": out})
         if path == "/api/admin/users":        # E1 超管: 用户清单/审计
             if user.get("role") != "admin":
                 return self._json(403, {"ok": False, "err": "仅超管"})
@@ -1168,11 +1466,12 @@ class Handler(BaseHTTPRequestHandler):
                 if m.group(2) != "messages":
                     return self._json(404, {"ok": False,
                                             "err": "归档会话没有实时流, 先「继续」"})
-                owner = _archived_owner(m.group(1))
-                if owner == "?":
+                pid, err = _proj_ctx(user, (q.get("pid") or [""])[0])
+                if err:                         # E6: 项目由前端带来
+                    return self._json(404, {"ok": False, "err": err})
+                apid = _archived_pid(m.group(1))
+                if apid is None:
                     return self._json(404, {"ok": False, "err": "会话不存在"})
-                if user.get("role") != "admin" and owner != user.get("uid"):
-                    return self._json(403, {"ok": False, "err": "不是你的会话"})
                 msgs = _archived_messages(m.group(1))
                 if msgs is None:
                     return self._json(404, {"ok": False, "err": "会话不存在"})
@@ -1180,6 +1479,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "archived": True})
             if not self._own(s, user):
                 return self._json(403, {"ok": False, "err": "不是你的会话"})
+            set_project(s.pid)             # E6: 本请求的分域上下文
             if m.group(2) == "messages":
                 return self._json(200, {"ok": True, "messages": s.history()})
             return self._sse(s, q)
@@ -1208,6 +1508,9 @@ class Handler(BaseHTTPRequestHandler):
         # ---- M2 三只读页(忆库/技能/账本): core 现成模块的薄包装 ----
         if path == "/api/memory":
             import memory as mem_mod
+            pid, err = _proj_ctx(user, (q.get("pid") or [""])[0])
+            if err:
+                return self._json(404, {"ok": False, "err": err})
             zone = (q.get("zone") or ["all"])[0]
             if zone not in ("archive", "forget"):
                 zone = "all"
@@ -1215,6 +1518,9 @@ class Handler(BaseHTTPRequestHandler):
                                     "cards": mem_mod.list_cards(zone)})
         if path == "/api/memory/card":
             import memory as mem_mod
+            pid, err = _proj_ctx(user, (q.get("pid") or [""])[0])
+            if err:
+                return self._json(404, {"ok": False, "err": err})
             title = (q.get("title") or [""])[0]
             content = mem_mod.read_card(title)
             if not content:
@@ -1234,6 +1540,9 @@ class Handler(BaseHTTPRequestHandler):
                                     "source": source})
         if path == "/api/ledger":
             import ledger as ledger_mod
+            pid, err = _proj_ctx(user, (q.get("pid") or [""])[0])
+            if err:
+                return self._json(404, {"ok": False, "err": err})
             try:
                 limit = int((q.get("limit") or ["100"])[0])
             except ValueError:
@@ -1264,6 +1573,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def run():
             set_user(s.uid)             # E1: 回合线程的分域上下文(记忆/账本落本人)
+            set_project(s.pid)          # E6: 项目上下文(记忆/账本/会话落当前项目)
             try:
                 s.app.send(text)
             except Exception as ex:                    # 回合崩了也要解锁+告知
@@ -1271,6 +1581,7 @@ class Handler(BaseHTTPRequestHandler):
                     "· 回合异常: %s: %s" % (type(ex).__name__, ex))[:300]}})
             finally:
                 set_user(None)
+                set_project(None)
                 with s.lock:
                     s.busy = False
         threading.Thread(target=run, daemon=True).start()
@@ -1420,6 +1731,7 @@ def main(argv=None):
     if not TOKEN:
         print("[警告] 没设 AT_WEB_TOKEN —— 公网部署前务必设置, 否则任何人都"
               "能花你的 key.")
+    migrate_projects()                     # E6: 老数据一次性迁进项目(幂等)
     httpd = build_server(args.port)
     print("agent-term web 后端已起: http://0.0.0.0:%d  (demo=%s, 前端=%s)"
           % (args.port, DEMO, STATIC_DIR or "未挂"))

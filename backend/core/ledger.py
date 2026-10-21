@@ -35,13 +35,15 @@ def _path() -> str:
 
 
 def append(entry: dict) -> bool:
-    """追加一条账(自动带自增 id). 失败返回 False 不抛(挂账路径必须静默)."""
+    """追加一条账(自动带自增 id). 失败返回 False 不抛(挂账路径必须静默).
+    E6: 目录按 _path() 的父目录建(服务器把 _path 补丁成项目目录)."""
     try:
-        os.makedirs(LEDGER_DIR, exist_ok=True)
         with _WRITE_LOCK:
             entry = dict(entry)
             entry["id"] = _next_id_locked()
-            with open(_path(), "a", encoding="utf-8") as f:
+            p = _path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
                 f.flush()
         return True
@@ -86,9 +88,10 @@ def append_score(entry_id, score, reason) -> tuple:
     if entry_id not in ids:
         return False, "没有 id=%d 的分包账(先 ledger list 看条目)" % entry_id
     try:
-        os.makedirs(LEDGER_DIR, exist_ok=True)
         with _WRITE_LOCK:
-            with open(_path(), "a", encoding="utf-8") as f:
+            p = _path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"type": "score", "id": entry_id,
                                     "score": score,
                                     "reason": reason.strip()},
